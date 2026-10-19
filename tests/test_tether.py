@@ -15,6 +15,7 @@ import importlib.util
 import io
 import json
 import os
+import queue
 import socket
 import ssl
 import tempfile
@@ -125,6 +126,44 @@ class Sink(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
+
+
+class HoldUpstream(http.server.BaseHTTPRequestHandler):
+    """Plays a model API whose stream stays open until the test lets it go:
+    message_start, then wait, then either finish with usage or abort mid-stream."""
+
+    protocol_version = "HTTP/1.1"
+    started: queue.Queue[threading.Event] = queue.Queue()
+    mode = "finish"
+    posts = 0
+
+    def log_message(self, *a: Any) -> None:
+        pass
+
+    def event(self, e: dict[str, Any]) -> None:
+        data = b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n"
+        self.wfile.write(b"%x\r\n" % len(data) + data + b"\r\n")
+        self.wfile.flush()
+
+    def do_POST(self) -> None:
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        HoldUpstream.posts += 1
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.end_headers()
+        usage = {"input_tokens": 10, "output_tokens": 1}
+        self.event({"type": "message_start", "message": {"model": "claude-opus-4-1", "usage": usage}})
+        go = threading.Event()
+        HoldUpstream.started.put(go)
+        go.wait(10)
+        if HoldUpstream.mode == "abort":
+            self.event({"type": "content_block_delta", "delta": {"text": "x" * 40000}})
+            self.close_connection = True  # no terminating chunk: the stream is cut short
+            return
+        self.event({"type": "message_delta", "usage": {"output_tokens": 100}})
+        self.event({"type": "message_stop"})
+        self.wfile.write(b"0\r\n\r\n")
 
 
 class WsUpstream:
@@ -1078,3 +1117,156 @@ class CapPolicyTest(TwoSandboxes):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReservationTest(TwoSandboxes):
+    """A metered call reserves its worst case at admission and settles at the
+    end of its stream, so calls in flight can't all slip under the cap."""
+
+    OPUS = {"model": "claude-opus-4-1", "max_tokens": 8000, "stream": True}  # reserves ~$0.60
+
+    def configure(self, cfg: dict[str, Any], up: str) -> None:
+        HoldUpstream.started = queue.Queue()
+        HoldUpstream.mode = "finish"
+        HoldUpstream.posts = 0
+        self.hold = serve(HoldUpstream)
+        self.held: list[threading.Event] = []
+        cfg["routes"]["slow"] = {
+            "upstream": f"http://127.0.0.1:{self.hold.server_address[1]}",
+            "credential": "env:T_ANTHROPIC",
+            "inject": "anthropic",
+            "meter": True,
+        }
+        cfg["spend"] = {"per_session_usd_per_day": 1.0, "max_inflight": 2}
+        cfg["prices_per_mtok"] = {"claude-opus": [15, 75], "default": [1, 1]}
+
+    def tearDown(self) -> None:
+        for go in self.held:
+            go.set()
+        self.hold.shutdown()
+        self.hold.server_close()
+        super().tearDown()
+
+    def slow_post(self, body: dict[str, Any]) -> tuple[int, bytes]:
+        c = http.client.HTTPConnection("127.0.0.1", self.ports["other"], timeout=10)
+        c.request("POST", "/slow/v1/messages", json.dumps(body), {"Authorization": "Bearer " + self.caps["o1"]})
+        r = c.getresponse()
+        out = r.read()
+        c.close()
+        return r.status, out
+
+    def start(self, body: dict[str, Any]) -> tuple[threading.Thread, dict[str, Any], threading.Event]:
+        """Start a call and return once the upstream holds it open."""
+        out: dict[str, Any] = {}
+
+        def run() -> None:
+            try:
+                out["status"], out["body"] = self.slow_post(body)
+            except (OSError, http.client.HTTPException) as e:
+                out["error"] = e
+
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        go = HoldUpstream.started.get(timeout=5)
+        self.held.append(go)
+        return t, out, go
+
+    def finish(self, t: threading.Thread, go: threading.Event) -> None:
+        go.set()
+        t.join(10)
+        self.assertFalse(t.is_alive())
+
+    def ledger(self) -> tether.Ledger:
+        return self.gw.ledger
+
+    def last_api(self) -> dict[str, Any]:
+        for _ in range(100):
+            recs = [r for r in self.audit() if r.get("kind") == "api" and r.get("decision") == "allow"]
+            if recs and "bytes_down" in recs[-1]:
+                return recs[-1]
+            time.sleep(0.02)
+        self.fail("no audit line")
+
+    def test_reservation_refuses_a_call_that_would_cross_the_cap(self) -> None:
+        t, out, go = self.start(self.OPUS)
+        self.assertAlmostEqual(
+            self.ledger().held["o1"], tether.reserve_usd(self.policy.prices, json.dumps(self.OPUS).encode())
+        )
+        # nothing is spent yet, so check-then-charge would admit this one too
+        st, body = self.slow_post(self.OPUS)
+        self.assertEqual(st, 403)
+        msg = json.loads(body)["error"]["message"]
+        self.assertIn("would be crossed", msg)
+        self.assertIn("reserved in flight", msg)
+        self.assertEqual(HoldUpstream.posts, 1, "a refused call must not reach the upstream")
+        self.assertEqual(self.audit()[-1]["decision"], "deny")
+        self.finish(t, go)
+        self.assertEqual(out["status"], 200)
+        # settled at the metered cost: 10*15 + 100*75 per M
+        self.assertEqual(self.ledger().held["o1"], 0.0)
+        self.assertEqual(self.ledger().inflight["o1"], 0)
+        self.assertAlmostEqual(self.ledger().spent["o1"], 0.00765, places=8)
+        rec = self.last_api()
+        self.assertAlmostEqual(rec["usd"], 0.00765, places=8)
+        self.assertGreater(rec["reserve_usd"], 0.6)
+        # with the reservation released, the same call fits again
+        t, out, go = self.start(self.OPUS)
+        self.finish(t, go)
+        self.assertEqual(out["status"], 200)
+        self.assertAlmostEqual(self.ledger().spent["o1"], 0.0153, places=8)
+
+    def test_max_inflight_refuses_the_next_call(self) -> None:
+        cheap = {"model": "claude-opus-4-1", "max_tokens": 10, "stream": True}
+        a = self.start(cheap)
+        b = self.start(cheap)
+        st, body = self.slow_post(cheap)
+        self.assertEqual(st, 403)
+        self.assertIn("2 calls already in flight for session o1 (max_inflight 2)", json.loads(body)["error"]["message"])
+        self.assertEqual(HoldUpstream.posts, 2)
+        # another session has its own count
+        self.assertEqual(self.post("other", self.caps["o2"]), 200)
+        for t, _, go in (a, b):
+            self.finish(t, go)
+        self.assertEqual(self.ledger().inflight["o1"], 0)
+        t, out, go = self.start(cheap)
+        self.finish(t, go)
+        self.assertEqual(out["status"], 200)
+
+    def test_aborted_stream_is_billed_at_the_floor(self) -> None:
+        HoldUpstream.mode = "abort"
+        t, out, go = self.start(self.OPUS)
+        self.finish(t, go)
+        rec = self.last_api()
+        self.assertTrue(rec["aborted"])
+        self.assertIn("floor", rec["reason"])
+        metered = (10 * 15 + 1 * 75) / 1_000_000
+        floor = tether.floor_usd(self.policy.prices, "claude-opus-4-1", rec["bytes_up"], rec["bytes_down"])
+        self.assertGreater(rec["bytes_down"], 40000)
+        self.assertGreater(floor, metered)
+        self.assertAlmostEqual(rec["usd"], round(floor, 6), places=8)
+        self.assertAlmostEqual(self.ledger().spent["o1"], rec["usd"], places=8)
+        self.assertEqual((self.ledger().held["o1"], self.ledger().inflight["o1"]), (0.0, 0))
+
+    def test_reserve_usd(self) -> None:
+        prices = {"claude-opus": [15, 75], "default": [1, 1]}
+        body = json.dumps({"model": "claude-opus-4-1", "max_tokens": 100}).encode()
+        self.assertAlmostEqual(tether.reserve_usd(prices, body), (len(body) / 4 * 15 + 100 * 75) / 1e6)
+        # no output limit in the body: DEFAULT_MAX_TOKENS
+        body = json.dumps({"model": "claude-opus-4-1"}).encode()
+        want = (len(body) / 4 * 15 + tether.DEFAULT_MAX_TOKENS * 75) / 1e6
+        self.assertAlmostEqual(tether.reserve_usd(prices, body), want)
+        # OpenAI Responses names it max_output_tokens
+        body = json.dumps({"model": "gpt-x", "max_output_tokens": 7}).encode()
+        self.assertAlmostEqual(tether.reserve_usd(prices, body), (len(body) / 4 + 7) / 1e6)
+        # not JSON, or no body: input only
+        self.assertAlmostEqual(tether.reserve_usd(prices, b"abcd" * 10), 10 / 1e6)
+        self.assertEqual(tether.reserve_usd(prices, None), 0.0)
+
+    def test_settle_is_idempotent(self) -> None:
+        led = self.ledger()
+        r, why = led.reserve("o1", 0.5, 1.0, None, 4)
+        self.assertIsNone(why)
+        assert r is not None
+        led.settle(r, 0.1)
+        led.settle(r, 0.1)
+        self.assertEqual((led.spent["o1"], led.held["o1"], led.inflight["o1"]), (0.1, 0.0, 0))

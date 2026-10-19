@@ -6,25 +6,32 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 8: **spend reservations and a max-inflight limit;
-non-retryable refusal** (design "Changes from today's leash" item 7). Today
-`Ledger` checks before a metered call and charges after, so overshoot equals
-the calls in flight. At admission on a metered route (the body is already
-buffered there, see run 12), reserve `len(body)/4 * input price +
-max_tokens * output price` (price from `price_for` on the body's `model`)
-against the session, the team total and the cap's sub-cap; refuse with 403
-(non-retryable) if `spent + reserved + this > cap`. At stream end, replace
-the reservation with the metered cost; if the stream aborted with no usage,
-bill a floor of ~4 chars per token on the bytes seen. Add a per-session
-`max_inflight` (policy `spend.max_inflight`, default e.g. 4) refused 403 the
-same way. Reservations live in memory (lost on restart is fine: no calls
-are in flight then); keep `spend.json` the charged totals. Unit tests:
-reservation refuses a call that would cross the cap while an earlier call is
-in flight (a fake upstream that holds the stream open), reconcile releases
-it, max_inflight refusal, the aborted-stream floor, and a `max_tokens`-less
-body (pick a default, record it). Then rerun the run-10 real check (haiku,
-max_tokens 5, sub-cap) to see the reservation bite on real traffic. Cage
-setup as in run 12.
+Milestone 3, item 9: **hash-chained audit with the new fields and
+`x-tether-request-id`** (design "Changes from today's leash" item 8, and
+"Request flow" step 6). Today `Audit.write` appends plain JSON lines with
+`sandbox`, `session`, `agent`, `tool`, `human`, `cap_id` (and
+`reserve_usd`/`aborted` since run 14). Add: a per-request `request_id`
+(e.g. `req_` + 16 hex) minted at the start of each handler and returned to
+the guest as the `x-tether-request-id` response header on every route
+response *and* on refusals (`_error`) and CONNECT replies;
+`upstream_request_id` from the upstream's `request-id` (Anthropic) or
+`x-github-request-id` header; `policy_version` (sha256 of the policy file
+bytes, first 12 hex, computed at load); `rule` (which check decided: e.g.
+`route:anthropic`, `egress:allow[2]`, `cap:route-grant`, `spend:sub-cap`,
+`addr`, `sni`); and the client-sent Claude Code IDs
+(`x-claude-code-session-id` if present; check what 2.1.303 actually sends
+before naming it -- the audit must never carry headers wholesale). Chain
+with `prev_hash` = sha256 of the previous line's bytes (first line:
+sha256 of "" or a genesis marker), computed under the existing lock; on
+start, read the last line of an existing audit.jsonl to continue the chain.
+Add `tether audit verify` that walks the file and reports the first broken
+link. Signed checkpoints over OTLP/HTTPS are team-mode: out of scope
+tonight, record that. Unit tests: request id header on a 200, a 403 and a
+CONNECT; ids match audit lines; chain verifies; editing one line breaks
+verify at that line; restart continues the chain; `upstream_request_id`
+captured from the fake upstream. Then a real run (cage gateway or a local
+serve with a haiku call) to see `request-id` from api.anthropic.com land in
+the audit.
 
 ## 0. Setup
 
@@ -274,7 +281,7 @@ Run 6 (2026-10-18) notes:
 - [x] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [x] Streamed request bodies (large `git push`)
 - [x] `Upgrade` passthrough on routes
-- [ ] Spend reservations and a max-inflight limit; non-retryable refusal
+- [x] Spend reservations and a max-inflight limit; non-retryable refusal
 - [ ] Hash-chained audit with the new fields and `x-tether-request-id`
 - [ ] Unit tests for each item; all tests pass
 
@@ -578,6 +585,67 @@ Run 13 (2026-10-19) notes:
   clients wait for the 200, so it hasn't mattered.
 - No model calls this run, no VM booted.
 
+Run 14 (2026-10-19) notes:
+
+- **Reservations:** on a metered route the body is read (buffered, as
+  before) **before** admission, then `reserve_usd(prices, body)` =
+  `(len(body)/4 * input + max_tokens * output) / 1e6` at `price_for(model)`.
+  The output limit is the first int of `max_tokens`, `max_output_tokens`,
+  `max_completion_tokens`; **decision: a JSON body naming none reserves
+  `DEFAULT_MAX_TOKENS` = 4096** (Messages requires max_tokens; OpenAI's
+  APIs don't). A body that isn't a JSON object (or no body) reserves input
+  only. `Gateway.admit(cap, est)` -> `Ledger.reserve(...)` checks and holds
+  under the ledger lock: max_inflight first, then session, team and the
+  cap's sub-cap, each `spent >= limit` -> "daily spend X reached for Y",
+  else `spent + held + est > limit` -> "daily spend X for Y would be crossed
+  ($spent spent + $held reserved in flight + $est for this call > $limit)".
+  All refusals 403 (non-retryable), audited with `reserve_usd`; admitted
+  lines carry `reserve_usd` too. `Gateway.cap_check` is gone.
+- **Settlement:** `_forward` (split out of `_proxy`) calls
+  `Ledger.settle(res, usd)` in the relay's `finally`, before the client sees
+  the last chunk; `_proxy` calls `settle(res, 0)` in an outer `finally`
+  (idempotent) so 502s, 499s and exceptions release the hold. Holds,
+  `cap_held` and `inflight` are memory-only; `spend.json` stays charged
+  totals. Holds survive the day roll.
+- **Aborted streams:** if the relay raises (upstream cut the chunked stream:
+  `IncompleteRead`; or the client went away) on a 2xx, usd =
+  `max(metered, floor_usd)` where the floor is 4 chars/token on `bytes_up`
+  (input price) and `bytes_down` (output price); the audit line gets
+  `aborted: true` and reason "stream aborted before its usage; billed at the
+  floor" when the floor wins. Non-2xx responses are never floored.
+- **Policy:** `spend.max_inflight` (default 4), per session.
+- **Tests** (`ReservationTest`, 6, with a `HoldUpstream` fake that sends
+  message_start then holds the stream until the test releases it): a second
+  opus call (reserve ~$0.60, cap $1) refused while the first is in flight
+  with nothing spent yet, no upstream request; first settles at $0.00765,
+  hold back to 0, then the same call fits again; max_inflight 2 refuses the
+  third (another session unaffected); aborted stream billed at the floor
+  (> metered), ledger matches the audit, hold released; `reserve_usd` table
+  (max_tokens, no limit -> 4096, max_output_tokens, non-JSON, None);
+  `settle` idempotent. `make test`: **68 tests OK** (leash 14 unchanged,
+  tether 54). ruff clean.
+- **Real run** (`overnight/run/rs/real.sh`, live `tether serve` on
+  127.0.0.1:18131, haiku at [1, 5] per M, streaming): (A) cap `--spend
+  0.00002`, max_tokens 5: **403 at admission** (reserve $0.00005), nothing
+  sent upstream -- in run 10 the same kind of cap let message 1 through and
+  only refused message 2. (B) cap `--spend 0.003`, two concurrent calls,
+  max_tokens 400 (reserve $0.002035 each): call 2, started 0.4 s into call
+  1, **403 "would be crossed ($0.0000 spent + $0.0020 reserved in flight +
+  $0.0020 ...)"**; call 1 200, settled at **$0.002021** (21 in / 400 out);
+  call 3 afterwards 403 ($0.0020 spent + $0.0020 > $0.0030). (C) session
+  max_inflight 2: third concurrent call 403 "2 calls already in flight",
+  the two 200s settled at $0.001521 each. Ledger total $0.005063 = the sum
+  of the three allowed lines. **The estimate was within 0.7 % of the
+  metered cost** here (4 bytes/token on a tiny body; out hit max_tokens).
+- **Note for milestone 7:** Claude Code sends a large `max_tokens` (check
+  the value in an audit `reserve_usd` line) and ~114 KB bodies, so each of
+  its calls reserves far more than it costs (cache reads bill at 0.1x but
+  are reserved at 1x). With the cage policy's $2 session cap that's fine
+  for haiku; an opus-priced session reserves enough per call that few fit
+  concurrently. That's the intended trade (bounded overshoot), but measure
+  it in the four-stream test.
+- The `$%.4f` in refusal messages shows a $0.00002 cap as $0.0000; cosmetic.
+
 ## Spend log
 
 | Run | Model calls | USD (from tether report) |
@@ -586,6 +654,7 @@ Run 13 (2026-10-19) notes:
 | 5 | 44 via leash + 22 direct (haiku, bench) | $0.0057 via leash; direct est. < $0.005 |
 | 10 | 2 (haiku, via tether, max_tokens 5) | $0.000066 |
 | 11 | 1 (haiku, Claude Code via tether, works.sh) | $0.0374 |
+| 14 | 3 allowed + 4 refused at admission (haiku, via tether, streaming) | $0.005063 |
 
 ## Decisions and corrections
 
