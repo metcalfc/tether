@@ -1,0 +1,77 @@
+{
+  "_note": "The PoC's one policy file (schema rl/poc-1, design/tether-poc.md 'Policy model', in JSON because tether is stdlib). `tether compile spike/msb/poc-policy.json -o overnight/run/compiled` emits the msb flags, a nono profile per agent and tether's own config; cage.sh boots from that. Credentials are keychain names, never values.",
+  "schema": "rl/poc-1",
+  "machine": {
+    "name": "tether-cage",
+    "image": "node:22-bookworm",
+    "cpus": 4,
+    "memory": "4G",
+    "port": 18001,
+    "sessions": ["cage"],
+    "humans": ["dev"],
+    "mounts": ["~/.microsandbox/tether-guest/bin:/opt/nono:ro"]
+  },
+  "gateway": {
+    "credentials": {
+      "anthropic": "keychain:tether-anthropic",
+      "github": "keychain:tether-gh-scratch"
+    },
+    "routes": {
+      "anthropic": {
+        "upstream": "https://api.anthropic.com",
+        "credential": "anthropic",
+        "inject": "anthropic",
+        "paths": ["/v1/messages", "/v1/messages/count_tokens", "/v1/models", "/v1/models/*"],
+        "meter": true
+      },
+      "github": {
+        "upstream": "https://github.com",
+        "credential": "github",
+        "inject": "basic:x-access-token",
+        "paths": [
+          "/metcalfc/tether-scratch/info/refs", "/metcalfc/tether-scratch.git/info/refs",
+          "/metcalfc/tether-scratch/git-upload-pack", "/metcalfc/tether-scratch.git/git-upload-pack",
+          "/metcalfc/tether-scratch/git-receive-pack", "/metcalfc/tether-scratch.git/git-receive-pack"
+        ]
+      }
+    },
+    "egress": {"deny_private": true, "ports": [443]},
+    "spend": {"prices": "builtin", "session_usd_per_day": 2.0, "max_inflight": 4}
+  },
+  "agents": {
+    "claude": {
+      "fs": {
+        "write": ["/work", "/tmp", "~/.claude", "~/.cache", "~/.npm"],
+        "write_file": ["~/.claude.json"],
+        "read": ["/usr", "/etc"]
+      },
+      "routes": ["anthropic"],
+      "egress": ["pypi.org", "files.pythonhosted.org"],
+      "settings": {"skipWebFetchPreflight": true},
+      "tools": {
+        "git": {"routes": ["github"], "fs": {"write": ["/work", "/tmp"]}},
+        "npm": {"egress": ["registry.npmjs.org"], "fs": {"write": ["/work", "/tmp", "~/.npm"]}, "scripts": true}
+      }
+    },
+    "codex": {
+      "fs": {
+        "write": ["/work", "/tmp", "~/.claude", "~/.cache", "~/.npm"],
+        "write_file": ["~/.claude.json"],
+        "read": ["/usr", "/etc"]
+      },
+      "egress": ["pypi.org"],
+      "tools": {
+        "git": {"routes": ["github"], "fs": {"write": ["/work", "/tmp"]}},
+        "npm": {"egress": ["registry.npmjs.org"], "fs": {"write": ["/work", "/tmp", "~/.npm"]}}
+      }
+    }
+  },
+  "ceiling": {
+    "routes": ["anthropic", "github"],
+    "egress": ["registry.npmjs.org", "pypi.org", "files.pythonhosted.org"],
+    "spend": {"session_usd_per_day": 2.0}
+  },
+  "audit": {"sink": "file:audit.jsonl"},
+  "state_dir": "../../overnight/run/tether-msb/state",
+  "placement": "laptop"
+}

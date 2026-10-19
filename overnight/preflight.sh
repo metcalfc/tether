@@ -39,7 +39,7 @@ else bad "scratch repo SCRATCH_REPO=${SCRATCH_REPO:-unset} not reachable"; fi
 [[ -z ${ANTHROPIC_API_KEY:-} ]] && ok "ANTHROPIC_API_KEY not exported" || warn "ANTHROPIC_API_KEY is exported here; run.sh unsets it"
 free_gb=$(df -g . | awk 'NR==2 {print $4}')
 (( free_gb >= 40 )) && ok "${free_gb} GB free" || warn "only ${free_gb} GB free; kernel build plus images want ~40 GB"
-python3 -m unittest discover -s tests >/dev/null 2>&1 && ok "leash unit tests pass" || bad "leash unit tests fail"
+python3 -m unittest discover -s tests >/dev/null 2>&1 && ok "unit tests pass" || bad "unit tests fail"
 [[ -f design/tether-poc.md ]] && ok "design doc present" || bad "design/tether-poc.md missing"
 [[ $(pmset -g 2>/dev/null | awk '$1 == "sleep" {print $2}') == 0 ]] && ok "system sleep disabled" || warn "Mac may sleep: run under caffeinate -dis (run.sh usage shows it)"
 echo

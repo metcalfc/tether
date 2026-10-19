@@ -1,9 +1,7 @@
 run/
 spike/run/
-spike/.vm/
 spike/record/*.mp4
 spike/record/*.gif
-workspace/
 __pycache__/
 .ruff_cache/
 overnight/config.env
