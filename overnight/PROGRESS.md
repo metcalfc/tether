@@ -6,25 +6,25 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 7: **`Upgrade` passthrough on routes** (design "Changes
-from today's leash" item 6: Codex and MCP over WebSocket). Today `upgrade`
-and `connection` are in `HOP` and stripped, so a WebSocket handshake on a
-route reaches the upstream as a plain GET. Make `_proxy` detect
-`Connection: upgrade` + `Upgrade: <proto>` on a route request: after the
-usual identify / route / grant checks, open a raw socket (TLS for https
-upstreams) to the route host, send the request line and headers with the
-credential injected and `Upgrade`/`Connection` kept, relay the upstream's
-response head; on **101** hand both sockets to `pump` (as CONNECT does) and
-audit bytes up/down and duration; on any other status relay the response and
-close. Decide whether metered routes may upgrade (probably refuse: the meter
-can't parse WebSocket frames; record the decision). Unit tests: a fake
-upstream that answers 101 and echoes frames bytes-for-bytes through tether,
-the credential is injected and the cap is not forwarded, an ungranted route
-still 403s before any upstream connect, a non-101 answer is relayed. Real
-run: a WebSocket echo through a route if one is reachable from the host
-(e.g. a temporary route to `wss://echo.websocket.org`, not kept in the
-committed policy); otherwise record that only the unit test ran. Cage setup
-as in run 12 (below).
+Milestone 3, item 8: **spend reservations and a max-inflight limit;
+non-retryable refusal** (design "Changes from today's leash" item 7). Today
+`Ledger` checks before a metered call and charges after, so overshoot equals
+the calls in flight. At admission on a metered route (the body is already
+buffered there, see run 12), reserve `len(body)/4 * input price +
+max_tokens * output price` (price from `price_for` on the body's `model`)
+against the session, the team total and the cap's sub-cap; refuse with 403
+(non-retryable) if `spent + reserved + this > cap`. At stream end, replace
+the reservation with the metered cost; if the stream aborted with no usage,
+bill a floor of ~4 chars per token on the bytes seen. Add a per-session
+`max_inflight` (policy `spend.max_inflight`, default e.g. 4) refused 403 the
+same way. Reservations live in memory (lost on restart is fine: no calls
+are in flight then); keep `spend.json` the charged totals. Unit tests:
+reservation refuses a call that would cross the cap while an earlier call is
+in flight (a fake upstream that holds the stream open), reconcile releases
+it, max_inflight refusal, the aborted-stream floor, and a `max_tokens`-less
+body (pick a default, record it). Then rerun the run-10 real check (haiku,
+max_tokens 5, sub-cap) to see the reservation bite on real traffic. Cage
+setup as in run 12.
 
 ## 0. Setup
 
@@ -273,7 +273,7 @@ Run 6 (2026-10-18) notes:
 - [x] Per-cap policy intersected with the ceiling
 - [x] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [x] Streamed request bodies (large `git push`)
-- [ ] `Upgrade` passthrough on routes
+- [x] `Upgrade` passthrough on routes
 - [ ] Spend reservations and a max-inflight limit; non-retryable refusal
 - [ ] Hash-chained audit with the new fields and `x-tether-request-id`
 - [ ] Unit tests for each item; all tests pass
@@ -528,6 +528,55 @@ Run 12 (2026-10-19) notes:
 - [ ] `overnight/REPORT.md` written
 - [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
 - [ ] `DONE` written to `overnight/STATUS`
+
+Run 13 (2026-10-19) notes:
+
+- **`Upgrade` passthrough:** `_proxy` checks `wants_upgrade(hdrs)`
+  (`Connection` lists `upgrade` and `Upgrade:` is set) **after** the
+  identify / path allowlist / cap / route-grant checks, so a refused upgrade
+  never opens an upstream connection. Then `_upgrade` opens a raw socket
+  (`ssl.create_default_context()` with SNI for https upstreams, 30 s connect
+  timeout), sends the request line and the usual forwarded headers (hop and
+  credential headers stripped, credential injected by `route.apply`) plus
+  `Upgrade: <proto>` and `Connection: Upgrade`, reads the response head
+  (`read_head`, 64 KiB cap). **101:** relay the head and any bytes after it,
+  forward bytes the client pipelined past its request head (drained from
+  `rfile`'s buffer without blocking, `buffered_bytes`), then `pump` both
+  sockets as CONNECT does; audit `status 101`, `upgrade`, `bytes_up`,
+  `bytes_down`, `ms` at close. **Other status:** parse it with
+  `http.client.HTTPResponse` over a `ReplaySocket` (the bytes already read
+  put back in front), relay as a chunked response with `Connection: close`,
+  audit "upstream refused the upgrade".
+- **Decision: metered routes refuse upgrades** (403 "upgrade is not offered
+  on metered route", audited, before any upstream connect). The meter reads
+  usage out of HTTP bodies and can't parse WebSocket frames, so a WebSocket
+  model call would step around the spend cap. Codex falls back to its
+  SSE/HTTPS transport (design R2). An upgrade carrying a request body is
+  refused 400.
+- `pump` now drains `SSLSocket.pending()` after each recv, so decrypted
+  bytes select() can't see are not stranded on a TLS upstream.
+- **Tests** (5 new, raw-socket `WsUpstream` fake that answers 101 with the
+  RFC 6455 accept and echoes): 101 splice with a 200 KB frame echoed byte for
+  byte, pipelined early bytes delivered, upstream sees `GET /base/mcp/socket?x=1`
+  with `Upgrade`/`Connection` kept, the injected Basic credential, no
+  `X-Api-Key` and no cap; no cap 401 / ungranted route 403 / off-allowlist
+  path 403 with **no** upstream connection; metered route 403 with nothing
+  upstream; upstream 426 relayed with its headers and body; `wants_upgrade`
+  table. `make test`: **63 tests OK** (leash 14 unchanged, tether 49). ruff
+  clean. (The `ConnectionAbortedError` tracebacks in the test output come
+  from `echo_server`'s accept thread at teardown and appear on the
+  pre-change tree too: 58 of them. Cosmetic, not fixed.)
+- **Real run** (`overnight/run/ws/`, live `tether serve` on 127.0.0.1:18121,
+  temporary route `echo` -> `https://echo.websocket.org`, not in any
+  committed policy): handshake `HTTP/1.1 101 Switching Protocols`, server
+  greeting received, a masked text frame `tether-ws-ok` echoed. Audit:
+  `allow status 101 upgrade websocket bytes_up 18 bytes_down 328 ms 428`.
+  Not tried from inside the msb guest (no WebSocket client there yet; the
+  path is the same `/route/` channel the guest already uses).
+- Known gap, not this item: `do_CONNECT` reads the ClientHello from the raw
+  socket and would lose bytes a client pipelined into `rfile`'s buffer;
+  clients wait for the 200, so it hasn't mattered.
+- No model calls this run, no VM booted.
 
 ## Spend log
 

@@ -127,6 +127,65 @@ class Sink(http.server.BaseHTTPRequestHandler):
         self.wfile.write(out)
 
 
+class WsUpstream:
+    """Plays a WebSocket server on a raw socket: answers 101 and echoes bytes, or
+    refuses with `refuse` as the status. Records each request head it was sent."""
+
+    def __init__(self, refuse: int | None = None) -> None:
+        self.refuse = refuse
+        self.heads: list[dict[str, str]] = []
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        threading.Thread(target=self.run, daemon=True).start()
+
+    def run(self) -> None:
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.one, args=(c,), daemon=True).start()
+
+    def one(self, c: socket.socket) -> None:
+        with c:
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                data = c.recv(65536)
+                if not data:
+                    return
+                buf += data
+            head, _, rest = buf.partition(b"\r\n\r\n")
+            lines = head.decode().split("\r\n")
+            h = {"_line": lines[0]}
+            for ln in lines[1:]:
+                k, _, v = ln.partition(":")
+                h[k.strip().lower()] = v.strip()
+            self.heads.append(h)
+            if self.refuse:
+                body = b"upgrade refused"
+                c.sendall(
+                    f"HTTP/1.1 {self.refuse} Nope\r\nContent-Length: {len(body)}\r\nX-Up: 1\r\n\r\n".encode() + body
+                )
+                return
+            accept = base64.b64encode(
+                hashlib.sha1((h["sec-websocket-key"] + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()
+            ).decode()
+            c.sendall(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n"
+                + f"Sec-WebSocket-Accept: {accept}\r\n\r\n".encode()
+                + b"hello-from-server"
+            )
+            if rest:
+                c.sendall(rest)
+            while data := c.recv(65536):
+                c.sendall(data)
+
+    def close(self) -> None:
+        self.sock.close()
+
+
 def serve(handler: type, port: int = 0) -> http.server.HTTPServer:
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -588,6 +647,120 @@ class TetherTest(unittest.TestCase):
             self.assertEqual(FakeUpstream.seen[-1]["headers"]["content-length"], "16")
         finally:
             tether.MAX_BODY = old
+
+    # --- Upgrade passthrough
+
+    def ws_route(self, refuse: int | None = None) -> WsUpstream:
+        ws = WsUpstream(refuse)
+        self.addCleanup(ws.close)
+        r = self.gw.p.routes["github"]
+        r.upstream = urllib.parse.urlsplit(f"http://127.0.0.1:{ws.port}/base")
+        r.paths = ["/*/info/refs", "/mcp/*"]
+        return ws
+
+    def ws_handshake(self, path: str, auth: str, early: bytes = b"") -> tuple[socket.socket, bytes]:
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        s.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: tether\r\nAuthorization: {auth}\r\nConnection: keep-alive, Upgrade\r\n"
+            "Upgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            "X-Api-Key: tth_leak\r\n\r\n".encode()
+            + early
+        )
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            data = s.recv(65536)
+            if not data:
+                break
+            buf += data
+        return s, buf
+
+    def recv_until(self, s: socket.socket, want: bytes, have: bytes = b"") -> bytes:
+        while want not in have:
+            data = s.recv(65536)
+            if not data:
+                break
+            have += data
+        return have
+
+    def test_upgrade_splices_after_101(self) -> None:
+        ws = self.ws_route()
+        auth = self.git_auth()["Authorization"]
+        s, buf = self.ws_handshake("/github/mcp/socket?x=1", auth, early=b"early-frame")
+        self.assertTrue(buf.startswith(b"HTTP/1.1 101 "), buf)
+        self.assertIn(b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", buf)
+        got = self.recv_until(s, b"early-frame", buf)
+        self.assertIn(b"hello-from-server", got)
+        frame = os.urandom(200_000)
+        s.sendall(frame)
+        echoed = b""
+        while len(echoed) < len(frame):
+            echoed += s.recv(65536)
+        self.assertEqual(echoed, frame)
+        s.close()
+        h = ws.heads[-1]
+        self.assertEqual(h["_line"], "GET /base/mcp/socket?x=1 HTTP/1.1")
+        self.assertEqual((h["upgrade"], h["connection"]), ("websocket", "Upgrade"))
+        self.assertEqual(h["sec-websocket-key"], "dGhlIHNhbXBsZSBub25jZQ==")
+        self.assertEqual(h["host"], f"127.0.0.1:{ws.port}")
+        self.assertEqual(
+            h["authorization"], "Basic " + base64.b64encode(f"x-access-token:{GH_TOKEN}".encode()).decode()
+        )
+        self.assertNotIn("x-api-key", h)
+        self.assertNotIn(self.caps["alice"], json.dumps(h))
+        rec = self.wait_audit_status(101)
+        self.assertEqual((rec["decision"], rec["route"], rec["upgrade"]), ("allow", "github", "websocket"))
+        self.assertEqual(rec["bytes_up"], len(b"early-frame") + len(frame))
+        self.assertGreater(rec["bytes_down"], len(frame))
+
+    def wait_audit_status(self, status: int) -> dict[str, Any]:
+        for _ in range(50):
+            recs = [r for r in self.audit() if r.get("status") == status]
+            if recs:
+                return recs[-1]
+            time.sleep(0.1)
+        self.fail(f"no audit line with status {status}: {self.audit()}")
+
+    def test_upgrade_refused_before_upstream(self) -> None:
+        ws = self.ws_route()
+        # no cap
+        s, buf = self.ws_handshake("/github/mcp/socket", "Bearer nope")
+        s.close()
+        self.assertTrue(buf.startswith(b"HTTP/1.1 401 "), buf)
+        # a cap without the route
+        cap, _ = self.gw.caps.mint("default", "alice", routes=["anthropic"])
+        s, buf = self.ws_handshake("/github/mcp/socket", "Bearer " + cap)
+        s.close()
+        self.assertTrue(buf.startswith(b"HTTP/1.1 403 "), buf)
+        self.assertIn("not granted", self.audit()[-1]["reason"])
+        # a path off the allowlist
+        s, buf = self.ws_handshake("/github/other", self.git_auth()["Authorization"])
+        s.close()
+        self.assertTrue(buf.startswith(b"HTTP/1.1 403 "), buf)
+        self.assertEqual(ws.heads, [], "a refused upgrade must not reach the upstream")
+
+    def test_upgrade_not_offered_on_metered_route(self) -> None:
+        s, buf = self.ws_handshake("/anthropic/v1/messages", "Bearer " + self.caps["alice"])
+        s.close()
+        self.assertTrue(buf.startswith(b"HTTP/1.1 403 "), buf)
+        self.assertEqual(FakeUpstream.seen, [])
+        self.assertIn("metered", self.audit()[-1]["reason"])
+
+    def test_upgrade_refused_by_upstream_is_relayed(self) -> None:
+        self.ws_route(refuse=426)
+        s, buf = self.ws_handshake("/github/mcp/socket", self.git_auth()["Authorization"])
+        got = self.recv_until(s, b"0\r\n\r\n", buf)
+        s.close()
+        self.assertTrue(got.startswith(b"HTTP/1.1 426 "), got)
+        self.assertIn(b"X-Up: 1", got)
+        self.assertIn(b"upgrade refused", got)
+        rec = self.wait_audit_status(426)
+        self.assertEqual(rec["reason"], "upstream refused the upgrade")
+
+    def test_wants_upgrade(self) -> None:
+        h = {"connection": "keep-alive, Upgrade", "upgrade": "websocket"}
+        self.assertEqual(tether.wants_upgrade(h), "websocket")
+        self.assertIsNone(tether.wants_upgrade({"upgrade": "websocket"}))
+        self.assertIsNone(tether.wants_upgrade({"connection": "upgrade"}))
 
     def test_audit_names_the_sandbox(self) -> None:
         self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})

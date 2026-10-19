@@ -41,6 +41,7 @@ import fnmatch
 import hashlib
 import http.client
 import http.server
+import io
 import ipaddress
 import json
 import os
@@ -49,6 +50,7 @@ import secrets
 import select
 import socket
 import socketserver
+import ssl
 import subprocess
 import sys
 import threading
@@ -86,6 +88,8 @@ HELLO_TIMEOUT_SECS = 10
 MAX_HELLO = 64 * 1024
 TLS_EXT_SNI = 0x0000
 TLS_EXT_ECH = 0xFE0D
+MAX_HEAD = 64 * 1024
+UPGRADE_CONNECT_SECS = 30
 
 # Claude Code drops this beta when it holds no OAuth credential of its own --
 # which is the whole point here -- and a Max subscription token is not honoured
@@ -633,6 +637,9 @@ def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
         for s in r:
             try:
                 data = s.recv(65536)
+                # A TLS socket can hold decrypted bytes select() can't see.
+                while data and isinstance(s, ssl.SSLSocket) and s.pending():
+                    data += s.recv(s.pending())
             except OSError:
                 data = b""
             if not data:
@@ -640,6 +647,65 @@ def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
             (b if s is a else a).sendall(data)
             sent[s] += len(data)
     return sent[a], sent[b]
+
+
+def wants_upgrade(headers: dict[str, str]) -> str | None:
+    """The protocol a request asks to switch to (`Connection: upgrade` plus `Upgrade:`), or None."""
+    tokens = {t.strip().lower() for t in headers.get("connection", "").split(",")}
+    proto = headers.get("upgrade", "").strip()
+    return proto if "upgrade" in tokens and proto else None
+
+
+def read_head(sock: socket.socket) -> tuple[bytes, bytes]:
+    """Read a response head off a raw socket: (head through the blank line, bytes after it)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > MAX_HEAD:
+            raise ValueError("response head too large")
+        data = sock.recv(65536)
+        if not data:
+            raise ValueError("upstream closed before a response")
+        buf += data
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head + b"\r\n\r\n", rest
+
+
+class _Replay(io.RawIOBase):
+    """A socket's read side with bytes already taken from it put back in front."""
+
+    def __init__(self, data: bytes, sock: socket.socket) -> None:
+        self.data, self.sock = data, sock
+
+    def readable(self) -> bool:
+        return True
+
+    def readinto(self, b: Any) -> int:
+        if self.data:
+            n = min(len(b), len(self.data))
+            b[:n], self.data = self.data[:n], self.data[n:]
+            return n
+        return self.sock.recv_into(b)
+
+
+class ReplaySocket:
+    """Enough of a socket for http.client.HTTPResponse to parse bytes we already read."""
+
+    def __init__(self, data: bytes, sock: socket.socket) -> None:
+        self.data, self.sock = data, sock
+
+    def makefile(self, mode: str) -> io.BufferedReader:
+        return io.BufferedReader(_Replay(self.data, self.sock))
+
+
+def buffered_bytes(rfile: Any, sock: socket.socket) -> bytes:
+    """Bytes the client sent past its request head that rfile has already buffered, without blocking."""
+    old = sock.gettimeout()
+    sock.setblocking(False)
+    try:
+        data = rfile.peek(MAX_HEAD)
+        return rfile.read(len(data)) if data else b""
+    finally:
+        sock.settimeout(old)
 
 
 def addr_refusal(addr: str, allowed: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> str | None:
@@ -1090,6 +1156,21 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 gw.audit.write(decision="deny", reason=not_granted, **rec)
                 self._error(403, "permission_error", f"route /{name}/ is not granted to this capability")
                 return
+            target = route.upstream.path.rstrip("/") + rest + (f"?{query}" if query else "")
+            proto = wants_upgrade(hdrs)
+            if proto:
+                # The meter reads usage out of HTTP bodies; it can't parse
+                # WebSocket frames, so an upgrade would step around the cap.
+                if route.meter:
+                    gw.audit.write(decision="deny", reason="upgrade is not offered on a metered route", **rec)
+                    self._error(403, "permission_error", f"upgrade is not offered on metered route /{name}/")
+                    return
+                if self.headers.get("transfer-encoding") or self.headers.get("content-length", "0").strip() != "0":
+                    gw.audit.write(decision="deny", reason="upgrade with a request body", **rec)
+                    self._error(400, "invalid_request_error", "upgrade with a request body is not supported")
+                    return
+                self._upgrade(route, target, hdrs, proto, rec, t0)
+                return
             session = cap["session"]
             if route.meter:
                 blocked = gw.cap_check(cap)
@@ -1113,7 +1194,6 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 fwd["transfer-encoding"] = "chunked"
             elif body.length:
                 fwd["content-length"] = str(body.length)
-            target = route.upstream.path.rstrip("/") + rest + (f"?{query}" if query else "")
             conn_cls = http.client.HTTPSConnection if route.upstream.scheme == "https" else http.client.HTTPConnection
             conn = conn_cls(route.upstream.hostname or "", route.upstream.port, timeout=600)
             try:
@@ -1178,6 +1258,79 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             if not nobody:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
+
+        def _upgrade(
+            self, route: Route, target: str, hdrs: dict[str, str], proto: str, rec: dict[str, Any], t0: float
+        ) -> None:
+            """Open the upstream by hand, keep Upgrade/Connection, and on 101 splice the two sockets."""
+            rec["upgrade"] = proto
+            self.close_connection = True
+            fwd = {k: v for k, v in hdrs.items() if k not in HOP and k not in CRED_HEADERS}
+            route.apply(fwd)
+            fwd.update(host=route.upstream.netloc, upgrade=proto, connection="Upgrade")
+            host = route.upstream.hostname or ""
+            tls = route.upstream.scheme == "https"
+            port = route.upstream.port or (443 if tls else 80)
+            head = f"{self.command} {target} HTTP/1.1\r\n" + "".join(f"{k}: {v}\r\n" for k, v in fwd.items())
+            try:
+                up = socket.create_connection((host, port), timeout=UPGRADE_CONNECT_SECS)
+                if tls:
+                    up = ssl.create_default_context().wrap_socket(up, server_hostname=host)
+            except OSError as e:
+                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                self._error(502, "api_error", "upstream error")
+                return
+            try:
+                try:
+                    up.sendall(head.encode("latin-1") + b"\r\n")
+                    resp_head, extra = read_head(up)
+                    status = int(resp_head.split(b"\r\n", 1)[0].split()[1])
+                except (OSError, ValueError, IndexError) as e:
+                    gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                    self._error(502, "api_error", "upstream error")
+                    return
+                if status == 101:
+                    up.settimeout(None)
+                    early = buffered_bytes(self.rfile, self.connection)
+                    self.connection.sendall(resp_head + extra)
+                    if early:
+                        up.sendall(early)
+                    up_bytes, down_bytes = pump(self.connection, up)
+                    gw.audit.write(
+                        decision="allow",
+                        status=101,
+                        bytes_up=len(early) + up_bytes,
+                        bytes_down=len(resp_head) + len(extra) + down_bytes,
+                        ms=int((time.monotonic() - t0) * 1000),
+                        **rec,
+                    )
+                    return
+                # Refused upgrade: relay the answer as an ordinary response.
+                resp = http.client.HTTPResponse(ReplaySocket(resp_head + extra, up), method=self.command)  # type: ignore[arg-type]
+                resp.begin()
+                self.send_response(resp.status)
+                for k, v in resp.getheaders():
+                    if k.lower() not in HOP:
+                        self.send_header(k, v)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                down = 0
+                while chunk := resp.read1(65536):
+                    down += len(chunk)
+                    self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+                gw.audit.write(
+                    decision="allow",
+                    status=resp.status,
+                    reason="upstream refused the upgrade",
+                    bytes_down=down,
+                    ms=int((time.monotonic() - t0) * 1000),
+                    **rec,
+                )
+            finally:
+                up.close()
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = _proxy
 
