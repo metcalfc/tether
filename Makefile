@@ -1,10 +1,11 @@
 .DEFAULT_GOAL := help
 export LEASH_UID := $(shell id -u)
 export LEASH_GID := $(shell id -g)
-.PHONY: help init up demo report logs down test lint clean spike-gw spike-up spike-report spike-record
+.PHONY: help init up demo report logs down test tether-test leash-test lint clean spike-gw spike-up spike-report spike-record
 
 help:
 	@echo 'make test     run the unit tests (no docker, no keys)'
+	@echo 'make tether-test   only the tether tests; make leash-test only the leash ones'
 	@echo ''
 	@echo 'spike (a QEMU VM whose only way out is leash; see spike/HANDOFF.md):'
 	@echo 'make spike-gw       run the gateway for the spike (key from the keychain)'
@@ -41,8 +42,14 @@ down:
 test:
 	python3 -m unittest discover -s tests -v
 
+tether-test:
+	python3 -m unittest -v tests.test_tether
+
+leash-test:
+	python3 -m unittest -v tests.test_leash
+
 lint:
-	ruff check --select E,F,W,I,B,UP --line-length 120 leash tests/
+	ruff check --select E,F,W,I,B,UP --line-length 120 leash tether tests/
 	shellcheck demo.sh spike/vm.sh spike/guest/*.sh spike/lima/*.sh
 
 spike-gw:

@@ -15,7 +15,7 @@ ok() { echo "  ok: $*"; }
 bad() { echo "  FAIL: $*"; fails=$((fails + 1)); }
 
 step "What this machine holds: capabilities, not keys"
-env | grep -E '^(ANTHROPIC|HTTPS_PROXY|OPENAI)' | sed -E 's/(lsh_[A-Za-z0-9_-]{6})[A-Za-z0-9_-]*/\1.../g'
+env | grep -E '^(ANTHROPIC|HTTPS_PROXY|OPENAI)' | sed -E 's/((lsh|tth)_[A-Za-z0-9_-]{6})[A-Za-z0-9_-]*/\1.../g'
 
 step "fetch a wheel from PyPI (allowlisted)"
 url=$(curl -sS -m 20 https://pypi.org/simple/requests/ | grep -oE 'https://files.pythonhosted.org/[^"#]+\.whl' | tail -1)

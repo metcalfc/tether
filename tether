@@ -1,0 +1,813 @@
+#!/usr/bin/env python3
+"""tether -- keep a coding agent's credentials, egress and spend outside the
+machine it runs on.
+
+Grown from leash for the microsandbox + nono PoC (design/tether-poc.md), in
+the spirit of imp (https://github.com/metcalfc/imp): the agent is handed a
+per-session capability string, never a credential. One gateway process, which the agent
+cannot reach into, does four things:
+
+  * injects real credentials into model-provider and git traffic
+    (/anthropic/..., /openai/..., /github/...), so no key sits on the box
+  * is the agent's only way out (HTTPS_PROXY + a network with no other
+    route), and only lets it CONNECT to hosts on an allowlist
+  * meters every model call per session from the response's own usage
+    numbers, and refuses the next call once a daily cap is passed
+  * writes one JSON line per decision, allow or deny, for `tether report`
+
+    agent VM / container                gateway (outside)
+    -----------------------------------------------------------
+    claude  --ANTHROPIC_BASE_URL-->  /anthropic  + real key --> api.anthropic.com
+    git     --insteadOf--------->    /github     + real token-> github.com
+    npm/pip --HTTPS_PROXY------->    CONNECT allowlist -------> registry.npmjs.org
+    curl evil.example ---------->    403, audited
+
+Stdlib only. Python 3.10+.
+
+    tether init   -c policy.json   mint session capabilities, write run/tether/<session>.env
+    tether serve  -c policy.json   run the gateway
+    tether report -c policy.json   spend and denials per session, from the audit log
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import fnmatch
+import http.client
+import http.server
+import json
+import os
+import posixpath
+import secrets
+import select
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+from collections import Counter, defaultdict
+from pathlib import Path
+from typing import Any
+
+# Headers that describe one hop, or that we always set ourselves. Credentials
+# the agent presents are stripped separately, before ours go on.
+HOP = {
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
+    "expect",
+}
+CRED_HEADERS = ("authorization", "x-api-key", "proxy-authorization")
+MAX_BODY = 64 * 1024 * 1024
+METER_BODY_LIMIT = 8 * 1024 * 1024
+TUNNEL_IDLE_SECS = 300
+
+# Claude Code drops this beta when it holds no OAuth credential of its own --
+# which is the whole point here -- and a Max subscription token is not honoured
+# without it. Same fix as imp.
+OAUTH_BETAS = ("claude-code-20250219", "oauth-2025-04-20")
+
+
+def log(msg: str) -> None:
+    print(f"[tether] {msg}", file=sys.stderr, flush=True)
+
+
+def today() -> str:
+    return dt.date.today().isoformat()
+
+
+def now_iso() -> str:
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+# --------------------------------------------------------------------- policy
+
+
+def resolve_credential(spec: str) -> str:
+    """env:NAME, cmd:<shell>, file:PATH. Read once, at start, outside the VM.
+
+    cmd: is the macOS-keychain / 1Password hook, e.g.
+      cmd:security find-generic-password -s anthropic -w
+      cmd:op read op://dev/anthropic/credential
+    """
+    if spec.startswith("env:"):
+        return os.environ.get(spec[4:], "").strip()
+    if spec.startswith("cmd:"):
+        r = subprocess.run(spec[4:], shell=True, capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    if spec.startswith("file:"):
+        p = Path(spec[5:]).expanduser()
+        return p.read_text().strip() if p.exists() else ""
+    return ""
+
+
+class Route:
+    def __init__(self, name: str, cfg: dict[str, Any]) -> None:
+        self.name = name
+        self.upstream = urllib.parse.urlsplit(cfg["upstream"])
+        self.inject: str = cfg.get("inject", "bearer")
+        self.paths: list[str] = cfg.get("paths", ["/*"])
+        self.meter = bool(cfg.get("meter", False))
+        self.credential = resolve_credential(cfg.get("credential", ""))
+
+    @property
+    def host(self) -> str:
+        return (self.upstream.hostname or "").lower()
+
+    def allowed(self, path: str) -> bool:
+        return any(fnmatch.fnmatchcase(path, p) for p in self.paths)
+
+    def apply(self, headers: dict[str, str]) -> None:
+        c = self.credential
+        if self.inject == "anthropic":
+            if c.startswith("sk-ant-oat"):
+                headers["authorization"] = "Bearer " + c
+                betas = [b.strip() for b in headers.get("anthropic-beta", "").split(",") if b.strip()]
+                for b in OAUTH_BETAS:
+                    if b not in betas:
+                        betas.append(b)
+                headers["anthropic-beta"] = ",".join(betas)
+            else:
+                headers["x-api-key"] = c
+        elif self.inject == "bearer":
+            headers["authorization"] = "Bearer " + c
+        elif self.inject.startswith("basic:"):
+            user = self.inject.split(":", 1)[1]
+            headers["authorization"] = "Basic " + base64.b64encode(f"{user}:{c}".encode()).decode()
+        else:
+            raise ValueError(f"route {self.name}: unknown inject mode {self.inject!r}")
+
+
+class Policy:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        cfg = json.loads(path.read_text())
+        base = path.parent
+        self.listen: str = cfg.get("listen", "0.0.0.0:8080")
+        self.advertise: str = cfg.get("advertise", "http://tether:8080")
+        self.state_dir = (base / cfg.get("state_dir", "run/tether")).resolve()
+        self.session_names: list[str] = cfg.get("sessions", ["default"])
+        self.routes: dict[str, Route] = {}
+        self.disabled_routes: list[str] = []
+        for name, rc in cfg.get("routes", {}).items():
+            r = Route(name, rc)
+            if r.credential:
+                self.routes[name] = r
+            else:
+                self.disabled_routes.append(name)
+        eg = cfg.get("egress", {})
+        self.egress_allow: list[str] = [h.lower() for h in eg.get("allow", [])]
+        self.egress_ports: set[int] = set(eg.get("ports", [443]))
+        sp = cfg.get("spend", {})
+        self.cap_session: float | None = sp.get("per_session_usd_per_day")
+        self.cap_total: float | None = sp.get("total_usd_per_day")
+        self.prices: dict[str, list[float]] = cfg.get("prices_per_mtok", {"default": [5, 25]})
+
+
+# ------------------------------------------------------------ sessions & env
+
+
+def load_sessions(policy: Policy) -> dict[str, str]:
+    """capability -> session name. Minted once, kept in state_dir/sessions.json
+    (0600). Delete that file to rotate every capability."""
+    policy.state_dir.mkdir(parents=True, exist_ok=True)
+    f = policy.state_dir / "sessions.json"
+    by_name: dict[str, str] = {}
+    if f.exists():
+        by_name = json.loads(f.read_text())
+    changed = False
+    for name in policy.session_names:
+        if name not in by_name:
+            by_name[name] = "tth_" + secrets.token_urlsafe(24)
+            changed = True
+    if changed or not f.exists():
+        f.write_text(json.dumps(by_name, indent=2))
+        f.chmod(0o600)
+    return {cap: name for name, cap in by_name.items() if name in policy.session_names}
+
+
+def env_for(policy: Policy, cap: str) -> dict[str, str]:
+    """What the agent's machine gets. Nothing in here is a credential: each
+    value is worthless anywhere but through this gateway."""
+    adv = urllib.parse.urlsplit(policy.advertise)
+    host = adv.netloc
+    authed = f"{adv.scheme}://agent:{cap}@{host}"
+    env = {
+        "TETHER_CAPABILITY": cap,
+        "HTTPS_PROXY": authed,
+        "HTTP_PROXY": authed,
+        "https_proxy": authed,
+        "http_proxy": authed,
+        "NO_PROXY": adv.hostname or "",
+        "no_proxy": adv.hostname or "",
+        # Claude Code otherwise phones home for telemetry and updates, which
+        # the allowlist would refuse -- noise in the audit log, not a threat.
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    }
+    if "anthropic" in policy.routes:
+        env["ANTHROPIC_BASE_URL"] = f"{policy.advertise}/anthropic"
+        env["ANTHROPIC_AUTH_TOKEN"] = cap
+    if "openai" in policy.routes:
+        env["OPENAI_BASE_URL"] = f"{policy.advertise}/openai/v1"
+        env["OPENAI_API_KEY"] = cap
+    if "github" in policy.routes:
+        # git sees https://github.com/... and quietly talks to the gateway.
+        env["GIT_CONFIG_COUNT"] = "1"
+        env["GIT_CONFIG_KEY_0"] = f"url.{authed}/github/.insteadOf"
+        env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
+    if "github-api" in policy.routes:
+        env["GH_HOST"] = "github.com"
+        env["GITHUB_API_URL"] = f"{policy.advertise}/github-api"
+    return env
+
+
+def write_env_files(policy: Policy, sessions: dict[str, str]) -> list[Path]:
+    out = []
+    for cap, name in sessions.items():
+        p = policy.state_dir / f"{name}.env"
+        lines = [f"{k}={v}" for k, v in env_for(policy, cap).items()]
+        body = "\n".join(lines)
+        p.write_text(f"# tether session {name} -- capabilities only, no credentials\n{body}\n")
+        p.chmod(0o600)
+        out.append(p)
+    return out
+
+
+# ------------------------------------------------------------ ledger & audit
+
+
+class Ledger:
+    """Today's spend per session. Persisted so a restart doesn't reset a cap."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+        self.day = today()
+        self.spent: dict[str, float] = {}
+        if path.exists():
+            d = json.loads(path.read_text())
+            if d.get("day") == self.day:
+                self.spent = d.get("spent", {})
+
+    def _roll(self) -> None:
+        if self.day != today():
+            self.day, self.spent = today(), {}
+
+    def totals(self, session: str) -> tuple[float, float]:
+        with self.lock:
+            self._roll()
+            return self.spent.get(session, 0.0), sum(self.spent.values())
+
+    def add(self, session: str, usd: float) -> None:
+        if usd <= 0:
+            return
+        with self.lock:
+            self._roll()
+            self.spent[session] = self.spent.get(session, 0.0) + usd
+            self.path.write_text(json.dumps({"day": self.day, "spent": self.spent}))
+
+
+class Audit:
+    """One JSON line per decision. Never headers, never bodies."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.lock = threading.Lock()
+
+    def write(self, **rec: Any) -> None:
+        rec = {"ts": now_iso(), **{k: v for k, v in rec.items() if v is not None}}
+        line = json.dumps(rec, separators=(",", ":"))
+        with self.lock, self.path.open("a") as f:
+            f.write(line + "\n")
+        flag = "DENY " if rec.get("decision") == "deny" else "allow"
+        what = rec.get("host") or f"{rec.get('method')} /{rec.get('route')}{rec.get('path', '')}"
+        extra = f" ${rec['usd']:.4f}" if rec.get("usd") else ""
+        why = f" -- {rec['reason']}" if rec.get("reason") else ""
+        log(f"{flag} [{rec.get('session', '-')}] {rec.get('kind')} {what}{extra}{why}")
+
+
+# --------------------------------------------------------------------- meter
+
+
+def price_for(prices: dict[str, list[float]], model: str) -> list[float]:
+    m = model.lower()
+    best = ""
+    for k in prices:
+        if k != "default" and m.startswith(k.lower()) and len(k) > len(best):
+            best = k
+    return prices.get(best) or prices.get("default") or [0, 0]
+
+
+def cost_usd(prices: dict[str, list[float]], model: str, u: dict[str, int]) -> float:
+    inp, out = price_for(prices, model)
+    # Cache writes at 1.25x input, reads at 0.1x -- Anthropic's published
+    # multipliers. Good enough to cap on; not good enough to invoice from.
+    tok = u.get("in", 0) * inp + u.get("cw", 0) * inp * 1.25 + u.get("cr", 0) * inp * 0.10 + u.get("out", 0) * out
+    return tok / 1_000_000
+
+
+class Meter:
+    """Reads usage out of a response as it streams past, without buffering
+    the stream. Handles Anthropic Messages (JSON or SSE) and OpenAI Chat /
+    Responses (JSON or SSE). Counts are taken as the max seen per field, which
+    is right for Anthropic's cumulative message_delta usage."""
+
+    FIELDS = {
+        "in": ("input_tokens", "prompt_tokens"),
+        "out": ("output_tokens", "completion_tokens"),
+        "cw": ("cache_creation_input_tokens",),
+        "cr": ("cache_read_input_tokens",),
+    }
+
+    def __init__(self, sse: bool) -> None:
+        self.sse = sse
+        self.buf = b""
+        self.body = bytearray()
+        self.model = ""
+        self.usage: dict[str, int] = {}
+
+    def feed(self, chunk: bytes) -> None:
+        if self.sse:
+            self.buf += chunk
+            *lines, self.buf = self.buf.split(b"\n")
+            for line in lines:
+                self._line(line)
+        elif len(self.body) < METER_BODY_LIMIT:
+            self.body += chunk
+
+    def finish(self) -> None:
+        if self.sse:
+            self._line(self.buf)
+        elif self.body:
+            self._obj(bytes(self.body))
+
+    def _line(self, line: bytes) -> None:
+        line = line.rstrip(b"\r")
+        if line.startswith(b"data:"):
+            self._obj(line[5:].strip())
+
+    def _obj(self, raw: bytes) -> None:
+        try:
+            o = json.loads(raw)
+        except ValueError:
+            return
+        if not isinstance(o, dict):
+            return
+        for cand in (o, o.get("message"), o.get("response")):
+            if not isinstance(cand, dict):
+                continue
+            if not self.model and isinstance(cand.get("model"), str):
+                self.model = cand["model"]
+            us = cand.get("usage")
+            if isinstance(us, dict):
+                for k, names in self.FIELDS.items():
+                    for n in names:
+                        v = us.get(n)
+                        if isinstance(v, int):
+                            self.usage[k] = max(self.usage.get(k, 0), v)
+
+
+# ------------------------------------------------------------------- gateway
+
+
+def normalize_path(raw: str) -> str | None:
+    p = urllib.parse.unquote(raw)
+    if not p.startswith("/") or "\x00" in p or "\\" in p:
+        return None
+    parts = p.split("/")
+    if ".." in parts:
+        return None
+    n = posixpath.normpath(p)
+    return n + ("/" if p.endswith("/") and n != "/" else "")
+
+
+def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
+    sent = {a: 0, b: 0}
+    socks = [a, b]
+    while True:
+        r, _, _ = select.select(socks, [], [], TUNNEL_IDLE_SECS)
+        if not r:
+            break
+        for s in r:
+            try:
+                data = s.recv(65536)
+            except OSError:
+                data = b""
+            if not data:
+                return sent[a], sent[b]
+            (b if s is a else a).sendall(data)
+            sent[s] += len(data)
+    return sent[a], sent[b]
+
+
+class Gateway:
+    def __init__(self, policy: Policy) -> None:
+        self.p = policy
+        self.sessions = load_sessions(policy)
+        self.ledger = Ledger(policy.state_dir / "spend.json")
+        self.audit = Audit(policy.state_dir / "audit.jsonl")
+        self.cred_hosts = {r.host: name for name, r in policy.routes.items()}
+
+    def session_for(self, presented: list[str]) -> str | None:
+        for cand in presented:
+            for cap, name in self.sessions.items():
+                if cand and secrets.compare_digest(cand.encode(), cap.encode()):
+                    return name
+        return None
+
+    def egress_ok(self, host: str, port: int) -> tuple[bool, str]:
+        if port not in self.p.egress_ports:
+            return False, f"port {port} is not allowed"
+        if host in self.cred_hosts:
+            return False, f"credentialed host; use the gateway route /{self.cred_hosts[host]}/"
+        if any(fnmatch.fnmatchcase(host, pat) for pat in self.p.egress_allow):
+            return True, ""
+        return False, "host is not on the egress allowlist"
+
+    def cap_check(self, session: str) -> str | None:
+        mine, total = self.ledger.totals(session)
+        if self.p.cap_session is not None and mine >= self.p.cap_session:
+            return f"daily spend cap reached for session {session} (${mine:.2f} of ${self.p.cap_session:.2f})"
+        if self.p.cap_total is not None and total >= self.p.cap_total:
+            return f"daily spend cap reached for the team (${total:.2f} of ${self.p.cap_total:.2f})"
+        return None
+
+
+def presented_tokens(headers: dict[str, str]) -> list[str]:
+    out: list[str] = []
+    for k in CRED_HEADERS:
+        v = headers.get(k)
+        if not v:
+            continue
+        low = v.lower()
+        if low.startswith("bearer "):
+            out.append(v[7:].strip())
+        elif low.startswith("basic "):
+            try:
+                user, _, pw = base64.b64decode(v[6:].strip()).decode().partition(":")
+            except ValueError:
+                continue
+            out += [pw, user]
+        else:
+            out.append(v.strip())
+    return out
+
+
+def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        server_version = "tether"
+        sys_version = ""
+
+        def log_message(self, fmt: str, *args: Any) -> None:
+            pass
+
+        def _hdrs(self) -> dict[str, str]:
+            return {k.lower(): v for k, v in self.headers.items()}
+
+        def _error(self, code: int, etype: str, msg: str, extra: dict[str, str] | None = None) -> None:
+            body = json.dumps({"type": "error", "error": {"type": etype, "message": "tether: " + msg}}).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            for k, v in (extra or {}).items():
+                self.send_header(k, v)
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(body)
+
+        # ---- egress: CONNECT host:port, allowlisted, audited
+        def do_CONNECT(self) -> None:
+            session = gw.session_for(presented_tokens(self._hdrs())) or "-"
+            host, _, port_s = self.path.rpartition(":")
+            host = host.strip("[]").lower()
+            try:
+                port = int(port_s)
+            except ValueError:
+                self._error(400, "invalid_request_error", "bad CONNECT target")
+                return
+            ok, why = gw.egress_ok(host, port)
+            if not ok:
+                gw.audit.write(kind="egress", decision="deny", session=session, host=f"{host}:{port}", reason=why)
+                self._error(403, "permission_error", f"{host}:{port} refused: {why}")
+                return
+            # Egress costs a capability like everything else: otherwise any
+            # process on the box gets out, and nothing says who it was.
+            if session == "-":
+                gw.audit.write(
+                    kind="egress",
+                    decision="deny",
+                    session=session,
+                    host=f"{host}:{port}",
+                    reason="bad or missing session capability",
+                )
+                self._error(
+                    407,
+                    "authentication_error",
+                    "bad or missing session capability",
+                    {"Proxy-Authenticate": 'Basic realm="tether"'},
+                )
+                return
+            try:
+                up = socket.create_connection((host, port), timeout=10)
+            except OSError as e:
+                gw.audit.write(
+                    kind="egress",
+                    decision="allow",
+                    session=session,
+                    host=f"{host}:{port}",
+                    status=502,
+                    reason=f"connect failed: {e}",
+                )
+                self._error(502, "api_error", f"could not reach {host}:{port}")
+                return
+            self.send_response(200, "Connection Established")
+            self.end_headers()
+            self.wfile.flush()
+            t0 = time.monotonic()
+            try:
+                up_bytes, down_bytes = pump(self.connection, up)
+            finally:
+                up.close()
+            self.close_connection = True
+            gw.audit.write(
+                kind="egress",
+                decision="allow",
+                session=session,
+                host=f"{host}:{port}",
+                bytes_up=up_bytes,
+                bytes_down=down_bytes,
+                ms=int((time.monotonic() - t0) * 1000),
+            )
+
+        # ---- credentialed routes: /<route>/<path>
+        def _proxy(self) -> None:
+            t0 = time.monotonic()
+            hdrs = self._hdrs()
+            session = gw.session_for(presented_tokens(hdrs))
+            if self.path.startswith(("http://", "https://")):
+                host = urllib.parse.urlsplit(self.path).hostname
+                gw.audit.write(
+                    kind="egress",
+                    decision="deny",
+                    session=session or "-",
+                    host=f"{host}:80",
+                    reason="plain-http forwarding is not offered",
+                )
+                self._error(403, "permission_error", "plain-http forwarding is not offered")
+                return
+
+            raw_path, _, query = self.path.partition("?")
+            path = normalize_path(raw_path)
+            if path is None:
+                self._error(400, "invalid_request_error", "malformed path")
+                return
+            _, name, rest = path.split("/", 2) if path.count("/") >= 2 else ("", path.strip("/"), "")
+            rest = "/" + rest
+            route = gw.p.routes.get(name)
+            rec: dict[str, Any] = {
+                "kind": "api",
+                "route": name,
+                "method": self.command,
+                "path": rest,
+                "session": session or "-",
+            }
+            if route is None:
+                gw.audit.write(decision="deny", reason="no such route", **rec)
+                self._error(404, "not_found_error", f"no route /{name}/")
+                return
+            if not route.allowed(rest):
+                gw.audit.write(decision="deny", reason="path is not on the route's allowlist", **rec)
+                self._error(403, "permission_error", f"{rest} is not allowed on /{name}/")
+                return
+            if session is None:
+                gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
+                extra = {"WWW-Authenticate": 'Basic realm="tether"'} if route.inject.startswith("basic:") else None
+                self._error(401, "authentication_error", "bad or missing session capability", extra)
+                return
+            if route.meter:
+                blocked = gw.cap_check(session)
+                if blocked:
+                    gw.audit.write(decision="deny", reason=blocked, **rec)
+                    # 403, not 429: a 429 is an invitation to retry.
+                    self._error(403, "permission_error", blocked)
+                    return
+            try:
+                body = self._read_body()
+            except ValueError as e:
+                self._error(400, "invalid_request_error", str(e))
+                return
+
+            fwd = {k: v for k, v in hdrs.items() if k not in HOP and k not in CRED_HEADERS}
+            route.apply(fwd)
+            fwd["host"] = route.upstream.netloc
+            fwd["accept-encoding"] = "identity"
+            if body:
+                fwd["content-length"] = str(len(body))
+            target = route.upstream.path.rstrip("/") + rest + (f"?{query}" if query else "")
+            conn_cls = http.client.HTTPSConnection if route.upstream.scheme == "https" else http.client.HTTPConnection
+            conn = conn_cls(route.upstream.hostname or "", route.upstream.port, timeout=600)
+            try:
+                conn.request(self.command, target, body=body or None, headers=fwd)
+                resp = conn.getresponse()
+            except OSError as e:
+                conn.close()
+                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                self._error(502, "api_error", "upstream error")
+                return
+
+            meter = Meter("text/event-stream" in (resp.getheader("content-type") or "")) if route.meter else None
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() not in HOP:
+                    self.send_header(k, v)
+            nobody = self.command == "HEAD" or resp.status in (204, 304) or resp.status < 200
+            down = 0
+            usd = None
+            try:
+                if nobody:
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self.send_header("Transfer-Encoding", "chunked")
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read1(65536)
+                        if not chunk:
+                            break
+                        down += len(chunk)
+                        if meter:
+                            meter.feed(chunk)
+                        self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+                        self.wfile.flush()
+            finally:
+                conn.close()
+                # Charged and recorded before the client sees the end of the
+                # response, so the agent's next call can't beat the ledger.
+                # Calls already in flight can still overshoot the cap.
+                if meter:
+                    meter.finish()
+                    usd = round(cost_usd(gw.p.prices, meter.model, meter.usage), 6)
+                    gw.ledger.add(session, usd)
+                    rec.update(model=meter.model or None, tokens=meter.usage or None)
+                gw.audit.write(
+                    decision="allow",
+                    status=resp.status,
+                    usd=usd,
+                    bytes_up=len(body),
+                    bytes_down=down,
+                    ms=int((time.monotonic() - t0) * 1000),
+                    **rec,
+                )
+            if not nobody:
+                self.wfile.write(b"0\r\n\r\n")
+                self.wfile.flush()
+
+        def _read_body(self) -> bytes:
+            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+                out = bytearray()
+                while True:
+                    size = int(self.rfile.readline(65537).split(b";")[0].strip() or b"0", 16)
+                    if size == 0:
+                        while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
+                            pass
+                        return bytes(out)
+                    out += self.rfile.read(size)
+                    self.rfile.readline(65537)
+                    if len(out) > MAX_BODY:
+                        raise ValueError("request body too large")
+            n = int(self.headers.get("Content-Length") or 0)
+            if n < 0 or n > MAX_BODY:
+                raise ValueError("bad Content-Length")
+            return self.rfile.read(n) if n else b""
+
+        do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = _proxy
+
+    return Handler
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # A client hanging up mid-stream is routine; a traceback per hangup is not.
+        exc = sys.exc_info()[1]
+        if not isinstance(exc, (BrokenPipeError, ConnectionResetError, TimeoutError)):
+            super().handle_error(request, client_address)
+
+
+def build_server(policy: Policy) -> tuple[Server, Gateway]:
+    gw = Gateway(policy)
+    host, _, port = policy.listen.rpartition(":")
+    srv = Server((host or "0.0.0.0", int(port)), make_handler(gw))
+    return srv, gw
+
+
+# ----------------------------------------------------------------------- cli
+
+
+def cmd_init(policy: Policy) -> None:
+    sessions = load_sessions(policy)
+    for p in write_env_files(policy, sessions):
+        log(f"wrote {p}")
+    for name in policy.disabled_routes:
+        log(f"route /{name}/ disabled: its credential did not resolve")
+
+
+def cmd_serve(policy: Policy) -> None:
+    srv, gw = build_server(policy)
+    write_env_files(policy, gw.sessions)
+    log(f"listening on {policy.listen}, advertised as {policy.advertise}")
+    log(f"routes: {', '.join('/' + n + '/' for n in policy.routes) or 'none'}")
+    for name in policy.disabled_routes:
+        log(f"route /{name}/ disabled: its credential did not resolve")
+    log(f"egress allowlist: {' '.join(policy.egress_allow) or '(nothing)'}")
+    caps = []
+    if policy.cap_session is not None:
+        caps.append(f"${policy.cap_session:.2f}/session/day")
+    if policy.cap_total is not None:
+        caps.append(f"${policy.cap_total:.2f}/team/day")
+    log(f"spend caps: {', '.join(caps) or 'none'}")
+    log(f"sessions: {', '.join(sorted(gw.sessions.values()))}")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        log("stopped -- every capability is inert until the gateway is back")
+
+
+def cmd_report(policy: Policy, as_json: bool) -> None:
+    f = policy.state_dir / "audit.jsonl"
+    if not f.exists():
+        print("no audit log yet")
+        return
+    day = today()
+    rows: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"requests": 0, "denied": 0, "usd_today": 0.0, "in": 0, "out": 0, "models": Counter(), "last": ""}
+    )
+    denied_hosts: Counter[str] = Counter()
+    for line in f.read_text().splitlines():
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        s = rows[r.get("session", "-")]
+        s["requests"] += 1
+        s["last"] = max(s["last"], r.get("ts", ""))
+        if r.get("decision") == "deny":
+            s["denied"] += 1
+            denied_hosts[r.get("host") or f"/{r.get('route')}{r.get('path', '')}"] += 1
+        if r.get("ts", "").startswith(day) and r.get("usd"):
+            s["usd_today"] += r["usd"]
+        t = r.get("tokens") or {}
+        s["in"] += t.get("in", 0) + t.get("cw", 0) + t.get("cr", 0)
+        s["out"] += t.get("out", 0)
+        if r.get("model"):
+            s["models"][r["model"]] += 1
+    if as_json:
+        print(json.dumps({k: {**v, "models": dict(v["models"])} for k, v in rows.items()}, indent=2))
+        return
+    cap = f" / ${policy.cap_session:.2f}" if policy.cap_session is not None else ""
+    print(f"{'SESSION':<20} {'REQS':>5} {'DENIED':>6} {'TOKENS IN/OUT':>16} {'SPEND TODAY':>18}  LAST SEEN")
+    for name, s in sorted(rows.items()):
+        toks = f"{s['in']}/{s['out']}"
+        spend = f"${s['usd_today']:.4f}{cap if name != '-' else ''}"
+        print(f"{name:<20} {s['requests']:>5} {s['denied']:>6} {toks:>16} {spend:>18}  {s['last'][11:19]}")
+    if denied_hosts:
+        print("\nmost refused:")
+        for h, n in denied_hosts.most_common(8):
+            print(f"  {n:>4}  {h}")
+
+
+def main(argv: list[str] | None = None) -> None:
+    ap = argparse.ArgumentParser(prog="tether", description=__doc__.split("\n\n")[0])
+    ap.add_argument("-c", "--config", default="policy.json", type=Path)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("init", help="mint session capabilities and write run/tether/<session>.env")
+    sub.add_parser("serve", help="run the gateway")
+    rp = sub.add_parser("report", help="spend and denials per session")
+    rp.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    policy = Policy(args.config)
+    if args.cmd == "init":
+        cmd_init(policy)
+    elif args.cmd == "serve":
+        cmd_serve(policy)
+    else:
+        cmd_report(policy, args.json)
+
+
+if __name__ == "__main__":
+    main()

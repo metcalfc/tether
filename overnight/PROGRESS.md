@@ -6,12 +6,17 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, first item: copy `./leash` to `./tether` and
-`tests/test_leash.py` to `tests/test_tether.py`, rename inside them (CLI
-name, state dir, `x-tether-request-id`, log prefix), add a `make` target for
-the tether tests, and confirm both suites pass (14 leash tests unchanged).
-Re-read the tether section of `design/tether-poc.md` first (new milestone).
-From now on, boot the cage with the Landlock kernel:
+Milestone 3, item 2: **channel binding** (one listener per sandbox on
+127.0.0.1; a cap works only on its own sandbox's listener). Suggested shape:
+policy gains `sandboxes: {name: {listen: "127.0.0.1:P"}}` (keep the
+top-level `listen` as a single-sandbox default), `build_server` starts one
+`ThreadingHTTPServer` per sandbox, each handler knows its sandbox name, and
+cap lookup refuses (403, audited with `sandbox`) a cap bound to another
+sandbox. Unit test: two listeners, cap A works on A's port and gets 403 on
+B's. Work in `./tether` and `tests/test_tether.py` only; `./leash` stays as
+is. The cap registry (item 3) will replace the static `sessions` list, so
+keep the sandbox->cap binding in one place that item 3 can take over.
+Boot the cage with the Landlock kernel when a VM is needed:
 `export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
 (rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
 if `overnight/run/` was wiped; ~11 min).
@@ -257,7 +262,7 @@ Run 6 (2026-10-18) notes:
 
 ## 3–4. tether core
 
-- [ ] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
+- [x] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
 - [ ] Channel binding: one listener per sandbox
 - [ ] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [ ] Per-cap policy intersected with the ceiling
@@ -267,6 +272,24 @@ Run 6 (2026-10-18) notes:
 - [ ] Spend reservations and a max-inflight limit; non-retryable refusal
 - [ ] Hash-chained audit with the new fields and `x-tether-request-id`
 - [ ] Unit tests for each item; all tests pass
+
+Run 7 (2026-10-18) notes:
+
+- Re-read the tether section, policy model, plan and success criteria.
+- `./tether` is a copy of `./leash` with: prog name, docstring and usage,
+  log prefix `[tether]`, `server_version`, Basic realm and error-message
+  prefix `tether`, cap prefix **`tth_`** (was `lsh_`), env var
+  **`TETHER_CAPABILITY`** (was `LEASH_CAPABILITY`), default advertise
+  `http://tether:8080`, and default state dir **`run/tether`** (relative to
+  the policy file; was `run`). `tests/test_tether.py` is the renamed copy plus
+  `test_tether_names` (cap prefix, env var, default state dir).
+- `x-tether-request-id` is **not** added yet: it belongs to the audit item
+  (item 9), with its own test.
+- `spike/msb/guest/works.sh` now masks both `lsh_` and `tth_` caps.
+- Makefile: `make tether-test`, `make leash-test`; `make lint` now covers
+  `tether`. `make test` discovers both suites: **29 tests OK** (leash 14
+  unchanged, tether 15). ruff clean.
+- No model calls this run, no VM booted.
 
 ## 5. Identity in the guest
 
