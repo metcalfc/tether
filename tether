@@ -41,6 +41,7 @@ import fnmatch
 import hashlib
 import http.client
 import http.server
+import ipaddress
 import json
 import os
 import posixpath
@@ -77,6 +78,10 @@ CRED_HEADERS = ("authorization", "x-api-key", "proxy-authorization")
 MAX_BODY = 64 * 1024 * 1024
 METER_BODY_LIMIT = 8 * 1024 * 1024
 TUNNEL_IDLE_SECS = 300
+HELLO_TIMEOUT_SECS = 10
+MAX_HELLO = 64 * 1024
+TLS_EXT_SNI = 0x0000
+TLS_EXT_ECH = 0xFE0D
 
 # Claude Code drops this beta when it holds no OAuth credential of its own --
 # which is the whole point here -- and a Max subscription token is not honoured
@@ -205,6 +210,9 @@ class Policy:
         eg = cfg.get("egress", {})
         self.egress_allow: list[str] = [h.lower() for h in eg.get("allow", [])]
         self.egress_ports: set[int] = set(eg.get("ports", [443]))
+        # Non-global addresses (loopback, RFC 1918, link-local, CGNAT, ULA...)
+        # a name may resolve to anyway: the host's own networks, opted into.
+        self.egress_addresses = [ipaddress.ip_network(c, strict=False) for c in eg.get("allow_addresses", [])]
         sp = cfg.get("spend", {})
         self.cap_session: float | None = sp.get("per_session_usd_per_day")
         self.cap_total: float | None = sp.get("total_usd_per_day")
@@ -630,6 +638,90 @@ def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
     return sent[a], sent[b]
 
 
+def addr_refusal(addr: str, allowed: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> str | None:
+    """Why a tunnel may not go to `addr`, or None. Only global unicast
+    addresses pass, unless the policy allowlists the address: a gateway on the
+    host sits on the host's loopback, LAN and VPN, which the guest must not
+    reach through it."""
+    a = ipaddress.ip_address(addr.partition("%")[0])
+    if isinstance(a, ipaddress.IPv6Address) and a.ipv4_mapped:
+        a = a.ipv4_mapped
+    if any(a in net for net in allowed):
+        return None
+    if a.is_global and not a.is_multicast:
+        return None
+    return f"resolves to non-public address {a}"
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ValueError("connection closed before a ClientHello")
+        buf += chunk
+    return buf
+
+
+def read_client_hello(sock: socket.socket) -> tuple[bytes, bytes]:
+    """(raw TLS records, handshake bytes) for the guest's first handshake
+    message, which may span several records."""
+    raw, hs = b"", b""
+    while True:
+        head = recv_exact(sock, 5)
+        if head[0] != 0x16:
+            raise ValueError("not a TLS handshake")
+        body = recv_exact(sock, int.from_bytes(head[3:5], "big"))
+        raw, hs = raw + head + body, hs + body
+        if len(hs) >= 4:
+            need = 4 + int.from_bytes(hs[1:4], "big")
+            if need > MAX_HELLO:
+                raise ValueError("ClientHello too large")
+            if len(hs) >= need:
+                return raw, hs
+
+
+def client_hello_sni(hs: bytes) -> str:
+    """The host_name in a ClientHello's server_name extension. Fails closed:
+    no SNI, an encrypted ClientHello or anything malformed raises ValueError."""
+    if not hs or hs[0] != 1:
+        raise ValueError("not a ClientHello")
+    end = 4 + int.from_bytes(hs[1:4], "big")
+    if end > len(hs):
+        raise ValueError("malformed ClientHello: truncated")
+    pos = 4 + 2 + 32  # header, client_version, random
+
+    def take(n: int, limit: int = end) -> bytes:
+        nonlocal pos
+        if pos + n > limit:
+            raise ValueError("malformed ClientHello")
+        out = hs[pos : pos + n]
+        pos += n
+        return out
+
+    take(take(1)[0])  # session_id
+    take(int.from_bytes(take(2), "big"))  # cipher_suites
+    take(take(1)[0])  # compression_methods
+    ext_end = pos + 2 + int.from_bytes(take(2), "big")
+    if ext_end > end:
+        raise ValueError("malformed ClientHello")
+    sni = None
+    while pos < ext_end:
+        etype, data = int.from_bytes(take(2, ext_end), "big"), take(int.from_bytes(take(2, ext_end), "big"), ext_end)
+        if etype == TLS_EXT_ECH:
+            raise ValueError("encrypted ClientHello")
+        if etype == TLS_EXT_SNI:
+            i = 2
+            while i + 3 <= len(data):
+                n = int.from_bytes(data[i + 1 : i + 3], "big")
+                if data[i] == 0 and i + 3 + n <= len(data):
+                    sni = data[i + 3 : i + 3 + n].decode("ascii", "replace").lower()
+                i += 3 + n
+    if not sni:
+        raise ValueError("no SNI")
+    return sni
+
+
 # (reason for the audit log, message for the guest)
 Refusal = tuple[str, str]
 
@@ -672,12 +764,28 @@ class Gateway:
             return False, f"port {port} is not allowed"
         if host in self.cred_hosts:
             return False, f"credentialed host; use the gateway route /{self.cred_hosts[host]}/"
+        try:
+            ipaddress.ip_address(host.partition("%")[0])
+            return False, "IP literal; CONNECT by name"
+        except ValueError:
+            pass
         if not any(fnmatch.fnmatchcase(host, pat) for pat in self.p.egress_allow):
             return False, "host is not on the egress allowlist"
         grant = cap.get("egress") if cap else None
         if grant is not None and not any(fnmatch.fnmatchcase(host, pat) for pat in grant):
             return False, f"host is not in capability {cap['cap_id']}'s egress grant"
         return True, ""
+
+    def resolve(self, host: str, port: int) -> tuple[list[str], str | None]:
+        """Resolve on the host, once. (addresses, refusal): if any address is
+        refused, all are, so a round-robin answer can't sneak one through.
+        Raises OSError if the name does not resolve."""
+        addrs = list(dict.fromkeys(ai[4][0] for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        for a in addrs:
+            why = addr_refusal(a, self.p.egress_addresses)
+            if why:
+                return addrs, why
+        return addrs, None
 
     def route_ok(self, cap: dict[str, Any], route: str) -> str | None:
         grant = cap.get("routes")
@@ -782,23 +890,57 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     {"Proxy-Authenticate": 'Basic realm="tether"'},
                 )
                 return
+            # Resolve here and dial the checked address, never the name again:
+            # a second lookup could answer differently (DNS rebinding).
             try:
-                up = socket.create_connection((host, port), timeout=10)
+                addrs, why = gw.resolve(host, port)
             except OSError as e:
-                gw.audit.write(decision="allow", status=502, reason=f"connect failed: {e}", **rec)
+                gw.audit.write(decision="allow", status=502, reason=f"resolve failed: {e}", **rec)
+                self._error(502, "api_error", f"could not resolve {host}")
+                return
+            if why:
+                gw.audit.write(decision="deny", reason=why, addrs=addrs, **rec)
+                self._error(403, "permission_error", f"{host}:{port} refused: {why}")
+                return
+            up, err = None, ""
+            for a in addrs:
+                try:
+                    up = socket.create_connection((a, port), timeout=10)
+                    rec["addr"] = a
+                    break
+                except OSError as e:
+                    err = str(e)
+            if up is None:
+                gw.audit.write(decision="allow", status=502, reason=f"connect failed: {err}", addrs=addrs, **rec)
                 self._error(502, "api_error", f"could not reach {host}:{port}")
                 return
             self.send_response(200, "Connection Established")
             self.end_headers()
             self.wfile.flush()
+            self.close_connection = True
+            # The tunnel must carry TLS to the host it was opened for: the
+            # ClientHello's SNI must equal the CONNECT host. No SNI, an
+            # encrypted ClientHello or not-TLS fails closed.
             t0 = time.monotonic()
             try:
+                self.connection.settimeout(HELLO_TIMEOUT_SECS)
+                raw, hs = read_client_hello(self.connection)
+                sni = client_hello_sni(hs)
+                self.connection.settimeout(None)
+                why = None if sni == host else f"SNI {sni} does not match CONNECT host {host}"
+            except (ValueError, OSError) as e:
+                why = f"ClientHello refused: {e}"
+            if why:
+                up.close()
+                gw.audit.write(decision="deny", reason=why, **rec)
+                return
+            try:
+                up.sendall(raw)
                 up_bytes, down_bytes = pump(self.connection, up)
             finally:
                 up.close()
-            self.close_connection = True
             ms = int((time.monotonic() - t0) * 1000)
-            gw.audit.write(decision="allow", bytes_up=up_bytes, bytes_down=down_bytes, ms=ms, **rec)
+            gw.audit.write(decision="allow", bytes_up=up_bytes + len(raw), bytes_down=down_bytes, ms=ms, **rec)
 
         # ---- credentialed routes: /<route>/<path>
         def _proxy(self) -> None:

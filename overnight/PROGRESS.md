@@ -6,29 +6,25 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 5: **CONNECT hardening** (design "Changes from today's
-leash", item 4). In `do_CONNECT`, after `egress_ok`: refuse IP-literal
-CONNECT targets; resolve the name on the host (`socket.getaddrinfo`); refuse
-if any resolved address is loopback, RFC 1918, link-local (169.254/16,
-fe80::/10), metadata (169.254.169.254, fd00:ec2::254), CGNAT (100.64/10),
-ULA (fc00::/7), unspecified or multicast, unless the policy allowlists that
-address (new `egress.allow_addresses: [CIDR...]`; use `ipaddress`); then
-connect to the checked address, not the name (no second lookup). SNI: after
-the 200, peek the guest's first bytes, parse the TLS ClientHello's
-server_name and refuse (close, audit `deny`) unless it equals the CONNECT
-host; no SNI / ECH / not TLS fails closed. **The existing tests CONNECT to
-`localhost` (loopback) on an echo server that is not TLS**: give the test
-policies `allow_addresses: ["127.0.0.1/32"]` and make the echo tests send a
-minimal ClientHello with SNI `localhost` (build one by hand in the test, or
-use `ssl.MemoryBIO` + `SSLContext.wrap_bio(server_hostname=...)` to produce
-real ClientHello bytes). Unit tests: IP literal refused; a name resolving to
-127.0.0.1 refused without the allowlist; SNI mismatch refused; plain non-TLS
-bytes refused; the audit has the resolved address. Real run: from the cage,
-`curl --proxy ... https://registry.npmjs.org/` still 200 and works.sh passes.
-Boot the cage with the Landlock kernel when a VM is needed:
-`export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
-(rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
-if `overnight/run/` was wiped; ~11 min).
+Milestone 3, item 6: **streamed request bodies** (design "Changes from
+today's leash"; large `git push`). Today `_read_body` buffers the whole
+request (MAX_BODY 64 MiB) before forwarding. Make `_proxy` stream the body
+upstream as it arrives: Content-Length bodies in chunks, and
+`Transfer-Encoding: chunked` bodies (git sends chunked for big pushes)
+re-chunked to the upstream without buffering. Keep buffering only where a
+route needs the body (metering parses the *response*, so check whether
+anything reads the request body: OAuth beta injection touches headers only).
+Unit tests: a 100 MiB+ chunked body reaches a fake upstream with bounded
+gateway memory (or at least without MAX_BODY refusing it); a Content-Length
+body streams; a client that stops mid-body is audited. Real run: from the
+cage, push a ~100 MB commit to `SCRATCH_REPO` on an `agent/*` branch through
+tether's github route (the policy already allows git-receive-pack on
+tether-scratch), then delete that branch. Use the run-11 tether cage setup:
+`export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib
+CAGE_GW=$PWD/tether CAGE_POLICY=$PWD/overnight/run/tether-msb/policy.json`
+(the policy is a copy of `spike/msb/policy.json` with `state_dir: state`;
+recreate it if `overnight/run/` was wiped), then `spike/msb/cage.sh gw-up`,
+`up`, `exec ...`, `down`.
 
 ## 0. Setup
 
@@ -275,7 +271,7 @@ Run 6 (2026-10-18) notes:
 - [x] Channel binding: one listener per sandbox
 - [x] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [x] Per-cap policy intersected with the ceiling
-- [ ] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
+- [x] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [ ] Streamed request bodies (large `git push`)
 - [ ] `Upgrade` passthrough on routes
 - [ ] Spend reservations and a max-inflight limit; non-retryable refusal
@@ -426,6 +422,51 @@ Run 10 (2026-10-18) notes:
   (from `state/spend.json` of the real run).
 - No VM booted.
 
+Run 11 (2026-10-19) notes:
+
+- **do_CONNECT order now:** identify -> 403 refusal -> `egress_ok` (port,
+  credentialed host, **IP literal refused** "IP literal; CONNECT by name",
+  ceiling, cap grant) -> 407 without a cap -> `Gateway.resolve` (one
+  `getaddrinfo` on the host; **if any** resolved address is non-public, the
+  CONNECT is refused 403 and the audit carries `addrs`) -> dial the checked
+  addresses in order (never the name again) -> 200 -> read the guest's first
+  TLS records (10 s timeout, handshake may span records, 64 KiB cap) ->
+  `client_hello_sni` must equal the CONNECT host, else close and audit
+  `deny` -> forward the hello bytes, then `pump`. Allow lines carry `addr`.
+- **Address rule** (`addr_refusal`): allowed iff `is_global and not
+  is_multicast` (IPv4-mapped v6 unwrapped first), or inside policy
+  `egress.allow_addresses: [CIDR...]` (new). Python's `is_global` already
+  excludes loopback, RFC 1918, link-local/metadata, CGNAT 100.64/10, ULA
+  (fd00:ec2::254), unspecified, benchmarking 198.18/15 and documentation
+  ranges; multicast needed the explicit check (224.0.0.1 `is_global` is True).
+- **SNI parse fails closed:** not TLS, not a ClientHello, truncated/malformed,
+  no SNI, or an ECH extension (0xfe0d) present -> refused. After the 200 there
+  is no HTTP status to send, so the guest just sees the connection close (an
+  RST if its bytes are unread).
+- **Tests:** test policies get `allow_addresses: ["127.0.0.1/32", "::1/128"]`
+  (macOS `localhost` resolves to both). Echo tests now send real ClientHello
+  bytes from `ssl.MemoryBIO` + `wrap_bio(server_hostname=...)`; `TwoSandboxes.connect`
+  sends one after a 200. New: IP literal refused (wire + `egress_ok`); name
+  resolving to 127.0.0.1 refused without the allowlist, audit has `addrs`;
+  SNI mismatch refused with nothing reaching the upstream; plain HTTP bytes
+  refused; parser unit tests (case-folded SNI, no SNI, ECH, truncated, not a
+  ClientHello, a real no-SNI hello); a hello split over three records;
+  `addr_refusal` table. `make test`: **53 tests OK** (leash 14 unchanged,
+  tether 39). ruff clean. The suite takes ~50 s (~1 s per test) -- it already
+  did before this change (45 s for 46); not investigated.
+- **Real run** (tether as the cage gateway, Landlock kernel): from the guest,
+  registry.npmjs.org 200, pypi.org 200, example.com refused, `--connect-to
+  registry.npmjs.org:443:pypi.org:443` (a fronting attempt: CONNECT pypi.org,
+  SNI registry.npmjs.org) refused with `SNI registry.npmjs.org does not match
+  CONNECT host pypi.org`, `https://104.16.0.35/` refused as IP literal.
+  `cage.sh attack`: 24 PASS, "all held". `npm install -g
+  @anthropic-ai/claude-code` through the hardened CONNECT: ok (2.1.303).
+  `cage.sh works`: all worked, incl. Claude Code (haiku) `TETHER_OK`. Resolved
+  addresses audited: 104.16.7.34, 151.101.{0,64,192}.223 -- all public, so the
+  host's resolver returns nothing the rule trips on.
+- Spend this run: 1 Claude Code call via tether (haiku), **$0.0374** (tether
+  report, session `cage`; mostly the cache write of Claude Code's prompt).
+
 ## 5. Identity in the guest
 
 - [ ] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
@@ -461,6 +502,7 @@ Run 10 (2026-10-18) notes:
 | 4 | 2 (haiku, via leash) | $0.0407 |
 | 5 | 44 via leash + 22 direct (haiku, bench) | $0.0057 via leash; direct est. < $0.005 |
 | 10 | 2 (haiku, via tether, max_tokens 5) | $0.000066 |
+| 11 | 1 (haiku, Claude Code via tether, works.sh) | $0.0374 |
 
 ## Decisions and corrections
 

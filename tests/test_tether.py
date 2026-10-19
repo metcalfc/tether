@@ -15,6 +15,7 @@ import io
 import json
 import os
 import socket
+import ssl
 import tempfile
 import threading
 import time
@@ -103,6 +104,37 @@ def echo_server() -> socket.socket:
     return s
 
 
+def tls_hello(host: str | None) -> bytes:
+    """Real ClientHello bytes from the ssl module, as a guest's client sends them."""
+    ctx = ssl.create_default_context()
+    if host is None:
+        ctx.check_hostname = False
+    out = ssl.MemoryBIO()
+    obj = ctx.wrap_bio(ssl.MemoryBIO(), out, server_hostname=host)
+    with contextlib.suppress(ssl.SSLWantReadError):
+        obj.do_handshake()
+    return out.read()
+
+
+def handshake(exts: bytes) -> bytes:
+    """A minimal hand-built ClientHello handshake message with these extensions."""
+    body = b"\x03\x03" + bytes(32) + b"\x00" + b"\x00\x02\x13\x01" + b"\x01\x00"
+    body += len(exts).to_bytes(2, "big") + exts
+    return b"\x01" + len(body).to_bytes(3, "big") + body
+
+
+def ext(etype: int, data: bytes) -> bytes:
+    return etype.to_bytes(2, "big") + len(data).to_bytes(2, "big") + data
+
+
+def sni_ext(name: bytes) -> bytes:
+    entry = b"\x00" + len(name).to_bytes(2, "big") + name
+    return ext(0, len(entry).to_bytes(2, "big") + entry)
+
+
+LOOPBACK = ["127.0.0.1/32", "::1/128"]
+
+
 class TetherTest(unittest.TestCase):
     def setUp(self) -> None:
         FakeUpstream.seen = []
@@ -131,7 +163,7 @@ class TetherTest(unittest.TestCase):
                 },
                 "openai": {"upstream": up, "credential": "env:T_UNSET", "inject": "bearer"},
             },
-            "egress": {"allow": ["localhost"], "ports": [self.echo_port, 443]},
+            "egress": {"allow": ["localhost"], "ports": [self.echo_port, 443], "allow_addresses": LOOPBACK},
             "spend": {"per_session_usd_per_day": 1.0},
             "prices_per_mtok": {"claude-opus": [15, 75], "claude-sonnet": [3, 15], "default": [1, 1]},
         }
@@ -255,12 +287,101 @@ class TetherTest(unittest.TestCase):
         s.sendall((req + "\r\n").encode())
         return s.recv(4096), s
 
-    def test_egress_allowlisted_host_tunnels(self) -> None:
-        head, s = self.connect(f"localhost:{self.echo_port}", self.caps["alice"])
+    def tunnel(self, first: bytes, host: str = "localhost") -> bytes:
+        """CONNECT to the echo server, send `first`, return what came back."""
+        head, s = self.connect(f"{host}:{self.echo_port}", self.caps["alice"])
         self.assertIn(b"200", head.split(b"\r\n")[0])
-        s.sendall(b"ping")
-        self.assertEqual(s.recv(100), b"echo:ping")
+        s.sendall(first)
+        s.settimeout(5)
+        got = b""
+        with contextlib.suppress(ConnectionResetError):  # refused with our bytes unread: RST
+            while chunk := s.recv(65536):
+                got += chunk
         s.close()
+        return got
+
+    def wait_audit(self, n: int) -> list[dict[str, Any]]:
+        """The tunnel's audit line is written as its handler ends."""
+        for _ in range(100):
+            recs = self.audit()
+            if len(recs) >= n:
+                return recs
+            time.sleep(0.02)
+        self.fail("no audit line")
+
+    def test_egress_allowlisted_host_tunnels(self) -> None:
+        hello = tls_hello("localhost")
+        self.assertEqual(self.tunnel(hello)[:20], b"echo:" + hello[:15])
+        rec = self.wait_audit(1)[-1]
+        self.assertEqual((rec["decision"], rec["addr"]), ("allow", "127.0.0.1"))
+
+    # --- CONNECT hardening
+
+    def test_ip_literal_refused(self) -> None:
+        self.gw.p.egress_allow.append("::1")
+        head, s = self.connect(f"[::1]:{self.echo_port}", self.caps["alice"])
+        s.close()
+        self.assertIn(b"403", head.split(b"\r\n")[0])
+        self.assertIn("IP literal", self.audit()[-1]["reason"])
+        self.assertEqual(self.gw.egress_ok("10.0.0.1", 443)[1], "IP literal; CONNECT by name")
+
+    def test_name_resolving_to_loopback_needs_an_address_allowlist(self) -> None:
+        self.gw.p.egress_addresses = []
+        head, s = self.connect(f"localhost:{self.echo_port}", self.caps["alice"])
+        s.close()
+        self.assertIn(b"403", head.split(b"\r\n")[0])
+        rec = self.audit()[-1]
+        self.assertEqual(rec["decision"], "deny")
+        self.assertIn("non-public address", rec["reason"])
+        self.assertIn("127.0.0.1", rec["addrs"])
+
+    def test_sni_must_match_the_connect_host(self) -> None:
+        self.assertEqual(self.tunnel(tls_hello("example.com")), b"", "nothing reaches the upstream")
+        self.assertIn("SNI example.com does not match CONNECT host localhost", self.wait_audit(1)[-1]["reason"])
+
+    def test_not_tls_is_refused(self) -> None:
+        self.assertEqual(self.tunnel(b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"), b"")
+        rec = self.wait_audit(1)[-1]
+        self.assertEqual(rec["decision"], "deny")
+        self.assertIn("not a TLS handshake", rec["reason"])
+
+    def test_client_hello_sni_fails_closed(self) -> None:
+        self.assertEqual(tether.client_hello_sni(handshake(sni_ext(b"Registry.NPMjs.org"))), "registry.npmjs.org")
+        for hs, why in (
+            (handshake(b""), "no SNI"),
+            (handshake(sni_ext(b"x.org") + ext(0xFE0D, b"\x00" * 8)), "encrypted ClientHello"),
+            (handshake(sni_ext(b"x.org"))[:-3], "malformed"),
+            (b"\x02" + handshake(b"")[1:], "not a ClientHello"),
+        ):
+            with self.assertRaisesRegex(ValueError, why):
+                tether.client_hello_sni(hs)
+        with self.assertRaisesRegex(ValueError, "no SNI"):
+            tether.client_hello_sni(tether.read_client_hello(self.pair(tls_hello(None)))[1])
+
+    def pair(self, data: bytes) -> socket.socket:
+        a, b = socket.socketpair()
+        self.addCleanup(a.close)
+        self.addCleanup(b.close)
+        a.sendall(data)
+        return b
+
+    def test_client_hello_split_over_records(self) -> None:
+        hs = handshake(sni_ext(b"pypi.org"))
+        recs = b"".join(b"\x16\x03\x01" + len(c).to_bytes(2, "big") + c for c in (hs[:10], hs[10:30], hs[30:]))
+        raw, got = tether.read_client_hello(self.pair(recs + b"trailing"))
+        self.assertEqual((raw, got), (recs, hs))
+        self.assertEqual(tether.client_hello_sni(got), "pypi.org")
+
+    def test_addr_refusal(self) -> None:
+        for a in ("127.0.0.1", "10.1.2.3", "192.168.1.1", "169.254.169.254", "100.64.0.1", "fd00:ec2::254",
+                  "fe80::1", "::1", "::ffff:127.0.0.1", "0.0.0.0", "224.0.0.1", "ff02::1"):
+            self.assertIsNotNone(tether.addr_refusal(a, []), a)
+        for a in ("104.16.0.1", "2606:4700::1"):
+            self.assertIsNone(tether.addr_refusal(a, []), a)
+        import ipaddress
+
+        self.assertIsNone(tether.addr_refusal("10.1.2.3", [ipaddress.ip_network("10.0.0.0/8")]))
+        self.assertIsNone(tether.addr_refusal("::ffff:10.1.2.3", [ipaddress.ip_network("10.0.0.0/8")]))
 
     def test_egress_needs_a_capability(self) -> None:
         # Found in the VM spike: an allowlisted host was reachable with no capability at all.
@@ -345,7 +466,7 @@ class TwoSandboxes(unittest.TestCase):
             "routes": {
                 "anthropic": {"upstream": up, "credential": "env:T_ANTHROPIC", "inject": "anthropic", "meter": True},
             },
-            "egress": {"allow": ["localhost"], "ports": [self.echo_port]},
+            "egress": {"allow": ["localhost"], "ports": [self.echo_port], "allow_addresses": LOOPBACK},
         }
         self.configure(cfg, up)
         os.environ["T_ANTHROPIC"] = REAL_KEY
@@ -383,6 +504,9 @@ class TwoSandboxes(unittest.TestCase):
         auth = base64.b64encode(f"agent:{cap}".encode()).decode()
         s.sendall(f"CONNECT {host}:{self.echo_port} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
         head = s.recv(4096)
+        if b" 200 " in head:
+            s.sendall(tls_hello(host))
+            s.recv(4096)
         s.close()
         return head.split(b"\r\n")[0]
 
