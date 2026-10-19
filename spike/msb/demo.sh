@@ -43,7 +43,7 @@ since() { perl -e 'printf "%.1f", $ARGV[1]-$ARGV[0]' "$1" "$(now)"; }
 title() { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 show() { printf '\033[2m$ %s\033[0m\n' "$*"; } # the command a step runs, as text
 guest() { limit "$1" "$MSB" exec "$NAME" --no-stdin -- env SCRATCH_REPO="$SCRATCH" DEMO_MODEL="${DEMO_MODEL:-}" \
-  /opt/leash/demo.sh "${@:2}"; }
+  /opt/tether/demo.sh "${@:2}"; }
 mkdir -p "$LOGS"
 redact() { sed -E 's/tth_[A-Za-z0-9_-]+/tth_REDACTED/g'; }
 

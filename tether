@@ -2,7 +2,7 @@
 """tether -- keep a coding agent's credentials, egress and spend outside the
 machine it runs on.
 
-Grown from leash for the microsandbox + nono PoC (design/tether-poc.md), in
+Built for the microsandbox + nono PoC (design/tether-poc.md), in
 the spirit of imp (https://github.com/metcalfc/imp): the agent is handed a
 per-session capability string, never a credential. One gateway process, which the agent
 cannot reach into, does four things:
@@ -216,7 +216,7 @@ class Policy:
         self.advertise: str = cfg.get("advertise", "http://tether:8080")
         self.state_dir = (base / cfg.get("state_dir", "run/tether")).resolve()
         # Without a `sandboxes` map, the top-level listen/advertise/sessions
-        # are one sandbox called "default" -- leash's single-listener shape.
+        # are one sandbox called "default" -- a single listener.
         self.sandboxes: dict[str, Sandbox] = {}
         if "sandboxes" in cfg:
             if "sessions" in cfg:
@@ -254,8 +254,8 @@ class Policy:
         self.cap_session: float | None = sp.get("per_session_usd_per_day")
         self.cap_total: float | None = sp.get("total_usd_per_day")
         self.max_inflight: int = int(sp.get("max_inflight", 4))
-        # false: admit on `spent < cap` alone and charge at the end (leash's
-        # check-then-charge), so calls in flight can all overshoot. For measuring.
+        # false: admit on `spent < cap` alone and charge at the end
+        # (check-then-charge), so calls in flight can all overshoot. For measuring.
         self.reserve: bool = bool(sp.get("reserve", True))
         self.prices: dict[str, list[float]] = cfg.get("prices_per_mtok", {"default": [5, 25]})
         # From `tether compile`: what each agent's cap and each of its tools' caps may do.
@@ -462,7 +462,7 @@ CAP_FORMATS = ("env", "gitconfig", "npmrc")
 
 
 def cap_file_body(policy: Policy, cap: str, rec: dict[str, Any], fmt: str = "env") -> str:
-    """A cap in the shape its consumer reads. `env` is leash's env file. The
+    """A cap in the shape its consumer reads. `env` is the session env file. The
     tool formats are files a tool reads itself, for a sandbox (nono) that can
     grant one file to one tool but not put a secret in its environment:
     `gitconfig` (git -c include.path=...) carries the cap in an
@@ -519,7 +519,7 @@ def init_caps(
     policy: Policy, reg: Registry, sandboxes: list[str] | None = None, rotate: bool = False
 ) -> dict[str, str]:
     """One default cap per session (no agent, no tool), delivered as
-    state_dir/<session>.env -- leash's shape. Idempotent: a session whose env
+    state_dir/<session>.env. Idempotent: a session whose env
     file still holds a live cap keeps it. With `rotate` (a new boot), every
     cap of those sandboxes is revoked first and fresh ones are minted.
     Returns session -> cap for the caps minted now."""

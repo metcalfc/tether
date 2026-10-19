@@ -1,7 +1,7 @@
 # Overnight report: microsandbox + nono + tether PoC
 
 28 runs, Oct 18-19 2026, milestones 1-8 of `design/tether-poc.md`. The
-details and every number are in `spike/RESULTS.md` (section "PoC"); the
+details and every number are in `spike/RESULTS.md`; the
 run-by-run log, with commands, is `overnight/PROGRESS.md`. Model spend for
 the night: **about $0.73** (spend log in PROGRESS.md), nearly all haiku.
 

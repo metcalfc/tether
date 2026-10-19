@@ -46,48 +46,36 @@
 #   cage.sh down       stop and remove the sandbox(es), stop the gateway
 #   cage.sh status
 #
-# Environment: CAGE_NAME (tether-cage), CAGE_IMAGE (node:22-bookworm),
-# CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001),
-# CAGE_MODEL (claude-haiku-4-5, for works), CAGE_AGENTS ("claude codex"),
-# CAGE_NONO_DIR (~/.microsandbox/tether-guest/bin, mounted at /opt/nono).
-# CAGE_POLICY overrides the compiled tether config (replay-policy's file).
-# With CAGE_OUT (a `tether compile` output directory) the machine name, port,
-# agents, msb flags, tether policy and every grant come from there instead,
-# and CAGE_GW defaults to ./tether. CAGE_SOURCE is the policy `compile` reads
-# (spike/msb/poc-policy.json).
+# Environment: CAGE_OUT (overnight/run/compiled), the `tether compile` output
+# directory the machine name, port, agents, msb flags, tether policy and every
+# grant come from; CAGE_SOURCE (spike/msb/poc-policy.json), the policy
+# `compile` reads; CAGE_GW (./tether); CAGE_POLICY (CAGE_OUT/tether.json,
+# overridden by replay-policy's file); CAGE_MODEL (claude-haiku-4-5, for works).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 MSB=${MSB:-$HOME/.microsandbox/bin/msb}
-OUT=${CAGE_OUT:-}
+RUN=$REPO/overnight/run
+OUT=${CAGE_OUT:-$RUN/compiled}
 SOURCE=${CAGE_SOURCE:-$HERE/poc-policy.json}
-if [[ -n $OUT && -f $OUT/machine.env ]]; then
-  # shellcheck source=/dev/null # written by tether compile
-  . "$OUT/machine.env"
-  CAGE_GW=${CAGE_GW:-$REPO/tether}
-  CAGE_POLICY=${CAGE_POLICY:-$OUT/tether.json}
-fi
+# shellcheck source=/dev/null # written by tether compile
+[[ -f $OUT/machine.env ]] && . "$OUT/machine.env"
 SESSION=${CAGE_SESSION:-cage}
 NAME=${CAGE_NAME:-tether-cage}
-IMAGE=${CAGE_IMAGE:-node:22-bookworm}
-GW=${CAGE_GW:-$REPO/leash}
-POLICY=${CAGE_POLICY:-$HERE/policy.json}
+GW=${CAGE_GW:-$REPO/tether}
+POLICY=${CAGE_POLICY:-$OUT/tether.json}
 PORT=${CAGE_PORT:-18001}
-RUN=$REPO/overnight/run
 GW_PID=$RUN/cage-gw.pid
 GW_LOG=$RUN/cage-gw.log
-GUEST_ENV=/root/.leash.env
-GUEST_DIR=/opt/leash
-# The guest build of nono (linux aarch64, glibc), mounted read-only at /opt/nono.
-NONO_DIR=${CAGE_NONO_DIR:-$HOME/.microsandbox/tether-guest/bin}
+GUEST_ENV=/root/.tether.env
+GUEST_DIR=/opt/tether
 
 log() { printf '[cage] %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
-need_out() { [[ -n $OUT && -f $OUT/machine.env ]] || die "set CAGE_OUT to a tether compile output (cage.sh compile)"; }
+need_out() { [[ -f $OUT/machine.env ]] || die "no tether compile output in $OUT (cage.sh compile)"; }
 
 cmd_compile() {
-  [[ -n $OUT ]] || die "set CAGE_OUT (e.g. overnight/run/compiled)"
   "$REPO/tether" compile "$SOURCE" -o "$OUT"
 }
 
@@ -123,19 +111,13 @@ sandbox_exists() { "$MSB" list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$
 
 cmd_up() {
   sandbox_exists && die "sandbox $NAME exists; cage.sh down first"
+  need_out
   "$GW" -c "$POLICY" init
   local env
   env="$(state_dir)/$SESSION.env"
   [[ -f $env ]] || die "no $env after init"
   local args=() l t0 t1
-  if [[ -n $OUT ]]; then
-    need_out
-    while IFS= read -r l; do args+=("$l"); done <"$OUT/msb.args"
-  else
-    args=(create "$IMAGE" --name "$NAME" --cpus 4 --memory 4G
-      --net-default deny --net-rule "allow@host:tcp:$PORT"
-      --tmpfs /run/tether --mount-dir "$NONO_DIR:/opt/nono:ro")
-  fi
+  while IFS= read -r l; do args+=("$l"); done <"$OUT/msb.args"
   log "booting: msb ${args[*]}"
   t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
   limit 300 "$MSB" "${args[@]}" -q
@@ -155,21 +137,19 @@ push_files() {
     limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$f")"
     limit 30 "$MSB" exec "$NAME" -- chmod +x "$GUEST_DIR/$(basename "$f")"
   done
-  if [[ -n $OUT ]]; then
-    # The compiled nono profiles and Claude settings; nono.sh setup installs them.
-    limit 30 "$MSB" exec "$NAME" -- mkdir -p "$GUEST_DIR/nono" "$GUEST_DIR/settings"
-    for f in "$OUT"/nono/*.json "$OUT"/settings/*.json; do
-      [[ -f $f ]] || continue
-      limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$(dirname "$f")")/$(basename "$f")"
-    done
-  fi
-  log "pushed $GUEST_ENV and $GUEST_DIR/*.{sh,py}${OUT:+, nono/ and settings/ from $OUT}"
+  # The compiled nono profiles and Claude settings; nono.sh setup installs them.
+  limit 30 "$MSB" exec "$NAME" -- mkdir -p "$GUEST_DIR/nono" "$GUEST_DIR/settings"
+  for f in "$OUT"/nono/*.json "$OUT"/settings/*.json; do
+    [[ -f $f ]] || continue
+    limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$(dirname "$f")")/$(basename "$f")"
+  done
+  log "pushed $GUEST_ENV and $GUEST_DIR/*.{sh,py}, nono/ and settings/ from $OUT"
 }
 
 cmd_exec() {
   [[ $# -gt 0 ]] || die "usage: cage.sh exec CMD..."
   local inner
-  inner="set -a; . $GUEST_ENV; set +a; export LEASH_GW=http://host.microsandbox.internal:$PORT; $*"
+  inner="set -a; . $GUEST_ENV; set +a; export TETHER_GW=http://host.microsandbox.internal:$PORT; $*"
   "$MSB" exec "$NAME" --no-stdin -- bash -lc "$inner"
 }
 
@@ -223,7 +203,7 @@ cmd_attack() {
   local rc=0
   control_up
   limit 300 "$MSB" exec "$NAME" --no-stdin -- bash -lc \
-    "set -a; . $GUEST_ENV; set +a; export LEASH_GW=http://host.microsandbox.internal:$PORT CONTROL_PORT=$CTL_PORT HOST_LAN=$HOST_LAN; $GUEST_DIR/attack.sh" || rc=$?
+    "set -a; . $GUEST_ENV; set +a; export TETHER_GW=http://host.microsandbox.internal:$PORT CONTROL_PORT=$CTL_PORT HOST_LAN=$HOST_LAN; $GUEST_DIR/attack.sh" || rc=$?
   control_down
   return "$rc"
 }

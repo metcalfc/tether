@@ -35,7 +35,7 @@ cmd_env() {
     --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev 2>/dev/null | wc -l || true)
   echo "  files with a real key: $n"
   echo "root scans every process's memory (with a planted fake key as a positive control):"
-  /opt/leash/memscan.py --control 2>&1 | tail -3 | sed 's/^/  /'
+  /opt/tether/memscan.py --control 2>&1 | tail -3 | sed 's/^/  /'
 }
 
 cmd_fix() {

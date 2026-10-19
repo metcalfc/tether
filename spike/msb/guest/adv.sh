@@ -249,11 +249,11 @@ cmd_root() {
 
   # 2. Everything attack.sh tries, as root, with the nono supervisors gone.
   log "attack.sh as root (firewall flush, DNS, raw IPs, host ports, IPv6)"
-  # The leash-era env: HTTPS_PROXY with the session cap, which attack.sh strips for the raw probes.
+  # The session env: HTTPS_PROXY with the session cap, which attack.sh strips for the raw probes.
   set +e
   # shellcheck source=/dev/null # pushed by cage.sh up
-  ( set -a; . /root/.leash.env; set +a
-    LEASH_GW=$gw CONTROL_PORT=${CONTROL_PORT:-18002} HOST_LAN=${HOST_LAN:-} /opt/leash/attack.sh )
+  ( set -a; . /root/.tether.env; set +a
+    TETHER_GW=$gw CONTROL_PORT=${CONTROL_PORT:-18002} HOST_LAN=${HOST_LAN:-} /opt/tether/attack.sh )
   ATTACK_FAILS=$?
   set -e
   printf '  attack.sh failures: %s\n' "$ATTACK_FAILS"

@@ -1,70 +1,42 @@
 .DEFAULT_GOAL := help
-export LEASH_UID := $(shell id -u)
-export LEASH_GID := $(shell id -g)
-.PHONY: help init up demo report logs down test tether-test leash-test lint clean spike-gw spike-up spike-report spike-record
+# The demo's gateway config: the compiled policy plus a second sandbox for the replay step.
+POLICY ?= overnight/run/compiled/tether-replay.json
+.PHONY: help test lint compile demo-setup demo-teardown record report audit
 
 help:
-	@echo 'make test     run the unit tests (no docker, no keys)'
-	@echo 'make tether-test   only the tether tests; make leash-test only the leash ones'
+	@echo 'make test           run the unit tests (no sandbox, no keys)'
+	@echo 'make lint           ruff and shellcheck'
 	@echo ''
-	@echo 'spike (a QEMU VM whose only way out is leash; see spike/HANDOFF.md):'
-	@echo 'make spike-gw       run the gateway for the spike (key from the keychain)'
-	@echo 'make spike-up       mint capabilities, boot the locked VM'
-	@echo 'make spike-report   spend and denials for the spike session'
-	@echo 'make spike-record   record the demo with VHS'
-	@echo ''
-	@echo 'docker version:'
-	@echo 'make init     mint session capabilities, write run/<session>.env'
-	@echo 'make up       build and start gateway + agent containers'
-	@echo 'make demo     walk through what the agent can and cannot do'
-	@echo 'make report   spend and denials per session'
-	@echo 'make down     stop everything; capabilities go inert'
-
-init:
-	./leash -c policy.json init
-
-up: init
-	mkdir -p workspace
-	docker compose up -d --build
-
-demo:
-	./demo.sh
-
-report:
-	docker compose exec -T leash ./leash -c policy.json report
-
-logs:
-	docker compose logs -f leash
-
-down:
-	docker compose down
+	@echo 'the microsandbox + nono cage (see overnight/REPORT.md for prerequisites):'
+	@echo 'make compile        spike/msb/poc-policy.json -> msb flags, nono profiles, tether config'
+	@echo 'make demo-setup     fresh tether state, compile, gateway up'
+	@echo '                    then spike/msb/demo.sh 1 .. 10, one step each'
+	@echo 'make demo-teardown  cage down, gateway down'
+	@echo 'make record         record the whole demo with VHS'
+	@echo 'make report         spend and denials per (session, agent, tool)'
+	@echo 'make audit          verify the audit hash chain'
 
 test:
 	python3 -m unittest discover -s tests -v
 
-tether-test:
-	python3 -m unittest -v tests.test_tether
-
-leash-test:
-	python3 -m unittest -v tests.test_leash
-
 lint:
-	ruff check --select E,F,W,I,B,UP --line-length 120 leash tether tests/
-	shellcheck demo.sh spike/vm.sh spike/guest/*.sh spike/lima/*.sh
+	ruff check --select E,F,W,I,B,UP --line-length 120 tether tests/ spike/msb/*.py
+	shellcheck spike/msb/*.sh spike/msb/guest/*.sh spike/msb/kernel/*.sh overnight/*.sh
 
-spike-gw:
-	ANTHROPIC_API_KEY=$$(security find-generic-password -s leash-anthropic -w) \
-	  ./leash -c spike/policy.json serve
+compile:
+	spike/msb/cage.sh compile
 
-spike-up:
-	./leash -c spike/policy.json init
-	./spike/vm.sh up
+demo-setup:
+	spike/msb/demo.sh setup
 
-spike-report:
-	./leash -c spike/policy.json report
+demo-teardown:
+	spike/msb/demo.sh teardown
 
-spike-record:
-	vhs spike/record/demo.tape
+record:
+	vhs spike/record/poc-demo.tape
 
-clean: down
-	rm -rf run workspace
+report:
+	./tether -c $(POLICY) report --by tool
+
+audit:
+	./tether -c $(POLICY) audit verify

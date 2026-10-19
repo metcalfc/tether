@@ -33,7 +33,7 @@ PROFILES=/etc/tether/nono
 BIN=/opt/tether/bin
 NONO=/opt/nono/nono
 # What tether compile emitted, pushed here by cage.sh: nono/<agent>.json, settings/<agent>.json.
-COMPILED=/opt/leash
+COMPILED=/opt/tether
 
 log() { printf '[nono] %s\n' "$*"; }
 
@@ -219,10 +219,10 @@ cmd_proc() {
   set -- $AGENTS
   a=$1 b=$2
   PROBE=/opt/tether/procprobe.py
-  install -m 0755 /opt/leash/procprobe.py "$PROBE"
+  install -m 0755 /opt/tether/procprobe.py "$PROBE"
   rm -rf "/tmp/npminit-$a" && install -d -m 0700 -o "$a" -g "$a" "/tmp/npminit-$a"
 
-  # A listener that accepts and never answers, for the leash-style control.
+  # A listener that accepts and never answers, for the env-delivery control.
   python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 8081)); s.listen(8); c=[]
 while True: c.append(s.accept())' >/dev/null 2>&1 &
   hpid=$!
@@ -264,9 +264,9 @@ while True: c.append(s.accept())' >/dev/null 2>&1 &
   fdb=$(probe_as "  $b's session reopens /proc/<pid>/fd/3" as_agent "$b" "$BIN/agent-session")
   printf '%s\n' "$fdb"
 
-  # The leash-style delivery: the cap in a url rewrite. git hands the
+  # The env-style delivery: the cap in a url rewrite. git hands the
   # rewritten URL to git-remote-http as argv. Fake cap, hung listener.
-  log "control: leash-style env delivery (fake cap tth_fakecontrol in a url rewrite)"
+  log "control: env-style delivery (fake cap tth_fakecontrol in a url rewrite)"
   as_agent "$a" env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.http://agent:tth_fakecontrol@127.0.0.1:8081/github/.insteadOf \
     GIT_CONFIG_VALUE_0=https://github.com/ GIT_TERMINAL_PROMPT=0 /usr/bin/git ls-remote "https://github.com/$scratch" >/dev/null 2>&1 &
   sleep 2
@@ -303,7 +303,7 @@ while True: c.append(s.accept())' >/dev/null 2>&1 &
   expect "$b's session cannot list it" "fd=EACCES" "$fdb"
   expect "control: $a's unsandboxed UID reads its processes' environ (Landlock, not Unix perms, refuses)" "environ=ok+CAP" "$ua"
   expect_not "control: $b's UID is refused by Unix perms" "$b" "environ=ok" "$b $(grep -oE 'environ=[^ ]*' <<<"$ub" | grep 'ok' | tr '\n' ' ')"
-  expect "control: leash-style url rewrite leaks the cap through cmdline, even to $b's sandbox" "cmdline=ok+CAP" "$ctl"
+  expect "control: env-style url rewrite leaks the cap through cmdline, even to $b's sandbox" "cmdline=ok+CAP" "$ctl"
   rm -rf "/tmp/npminit-$a"
   echo "  $FAILS failed"
   return "$FAILS"

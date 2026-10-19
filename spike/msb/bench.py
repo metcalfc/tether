@@ -14,8 +14,8 @@ upstream, so the comparison is like for like.
 For each request it records: headers (time to response headers), ttfb (time
 to the first SSE data line), and the mean gap between SSE data lines.
 
-  bench.py ttfb    --env overnight/run/leash-msb/cage.env [-n 20] [--port 18001]
-  bench.py ttfb    --env /root/.leash.env --gateway-only --gw-host host.microsandbox.internal  (in the guest)
+  bench.py ttfb    --env overnight/run/tether-msb/state/cage.env [-n 20] [--port 18001]
+  bench.py ttfb    --env /root/.tether.env --gateway-only --gw-host host.microsandbox.internal  (in the guest)
   bench.py connect --env ... [-n 20] [--host registry.npmjs.org]
 
 `connect` times CONNECT setup with curl: time_appconnect for a HEAD through

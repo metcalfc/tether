@@ -1,82 +1,11 @@
-# Spike results: a Mac VM whose only way out is leash
-
-Fill this in as you go. Numbers beat adjectives.
-
-## Pre-flight (Linux cloud workspace, Oct 19, 2026)
-
-Run before handoff, on x86_64 under QEMU 8 emulation (no KVM, so timings
-are meaningless), with a fake Anthropic key.
-
-- `provision` 467 s, `up` to ssh 61 s (emulated).
-- `attack.sh`: all 11 block attempts held, including root flushing
-  nftables/iptables, resetting the default route, DNS through QEMU's own
-  resolver at 10.0.2.3, and the host's real ports at 10.0.2.2.
-- The pypi.org allow test failed for an environmental reason: that
-  workspace intercepts outbound TLS with its own CA, which the guest doesn't
-  trust. With `curl -k` it returns 200 through leash. This shouldn't happen on
-  the Mac.
-- The anthropic route reached the real API: 401 for the fake key.
-- Revoke worked: gateway stopped gave nothing to talk to; restarted gave the
-  same capability working again with no change to the VM.
-- **Bug found and fixed:** `CONNECT` to an allowlisted host worked with no
-  capability, so any process in the VM got out unattributed. Now 407, with a
-  unit test and an `attack.sh` line.
-- Not run: Claude Code in the guest, `cap.sh`, `works.sh`, the recording.
-
-## Setup
-
-- Machine: (model, chip, RAM, macOS version)
-- QEMU version: (`qemu-system-aarch64 --version`)
-- Guest: Ubuntu 24.04 minimal cloud image, arm64
-- leash commit: (`git rev-parse --short HEAD`)
-
-## Timings
-
-| Step | Time |
-| --- | --- |
-| `vm.sh provision` (first boot, tools installed) | |
-| `vm.sh up` to ssh ready | |
-| `claude -p` through leash (median of 5) | |
-| Same call from the host, direct (median of 5) | |
-| `pip download requests` through leash | |
-
-## Acceptance
-
-| Check | Expected | Result |
-| --- | --- | --- |
-| `make test` | 13 pass | |
-| `works.sh`: Claude Code returns LEASH_OK | works | |
-| `works.sh`: pip from pypi.org | works | |
-| `works.sh`: git clone via the github route (if a token is set) | works | |
-| `attack.sh`: every BLOCK line | blocked | |
-| `attack.sh`: DNS via 10.0.2.3 | blocked (if not: note it, it's a DNS channel) | |
-| No `sk-ant-` anywhere in the guest | none | |
-| `cap.sh` trips the cap | REFUSED within a few calls | |
-| `leash report` attributes everything to `demo` | yes | |
-| Ctrl-C leash, then `claude` in the VM | fails | |
-| Restart leash, `claude` again | works, same capability | |
-
-## Stretch: Lima
-
-- Lima with `vmType: qemu` and a `QEMU_SYSTEM_AARCH64` wrapper that adds
-  `restrict=on` and the `guestfwd`: (works / breaks what)
-- Lima with `vmType: vz`: is there a way to cut its user-mode network's
-  internet access while keeping ssh? (findings, one hour max)
-
-## Findings
-
-- What surprised you:
-- What a real implementation in Ringleader would need:
-- Estimate for Ringleader's QEMU driver, Lima driver, WSL2:
-
-## PoC: microsandbox + nono + tether (Mac, Oct 18-19, 2026)
+# Results: microsandbox + nono + tether (Mac, Oct 18-19, 2026)
 
 The design is `design/tether-poc.md`. Run-by-run notes, with logs and the
 exact commands, are in `overnight/PROGRESS.md`; "run N" below refers to
 them. Every number here was measured on this machine; anything not
 measured says "not run".
 
-### Setup
+## Setup
 
 - Machine: Mac16,1, Apple M4 (10 cores), 32 GB, macOS 26.6.2.
 - Cage: **msb 0.7.8** (release binary), image `node:22-bookworm`, 4 vCPU,
@@ -85,13 +14,13 @@ measured says "not run".
   `21f169f`, 5.6.1, Linux 6.12.111), rebuilt with Landlock
   (`spike/msb/kernel/`) and loaded with `MSB_LIBKRUNFW_PATH`.
 - **nono 0.80.0** in the guest (linux aarch64 glibc), Landlock ABI **V6**.
-- Gateway: `./tether` (stdlib Python, grown from `./leash`), on the host.
+- Gateway: `./tether` (stdlib Python), on the host.
   Claude Code **2.1.303** in the guest, `claude-haiku-4-5` for every
   functional test.
 - One policy file, `spike/msb/poc-policy.json`, compiled by `tether compile`
   into the msb flags, the nono profiles and the tether config.
 
-### Success criteria
+## Success criteria
 
 | Criterion (design) | Result | Evidence |
 | --- | --- | --- |
@@ -108,7 +37,7 @@ Kill criteria: none triggered. Landlock was in the guest on day 2; no
 escape from the cage was found; Claude Code worked with plain forwarding
 (no rewriting); nothing came near +50 ms or stalled.
 
-### Measurements
+## Measurements
 
 | Measurement | Result |
 | --- | --- |
@@ -127,7 +56,7 @@ escape from the cage was found; Claude Code worked with plain forwarding
 | nono launch cost | Session start (`nono run -- true`) 165 ms; a mediated `git --version` 24 ms/call vs < 1 ms plain (run 17) |
 | Kernel build | ~11 min wall, one attempt (run 6) |
 
-### The demo (run 28)
+## The demo (run 28)
 
 `spike/record/poc-demo.tape` drives `spike/msb/demo.sh`, one subcommand per
 step of the design's demo script, recorded unattended with VHS 0.12.1 to
@@ -141,13 +70,13 @@ the postinstall, root after killing nono (attack.sh 21 blocked, 0 failed)
 and the cap replay, all refused and attributed; the overshoot table;
 `tether cap revoke` turning the agent's next call from 200 into 403.
 
-### Fallbacks taken
+## Fallbacks taken
 
 None. The day-2 gate passed (Landlock V6), so nono and the per-tool
 claims stay; no escape meant no switch to QEMU; Claude Code needed no
 rewriting; latency stayed far under the 50 ms kill line.
 
-### Corrections and findings
+## Corrections and findings
 
 The design's "Corrections" section has the full list. The ones that change
 a claim:
@@ -173,7 +102,6 @@ a claim:
   not metered.
 - Run 27: tether's +6-8 ms at p50 came from building a TLS context per
   upstream request. Fixed (one shared verifying context, unit-tested).
-  Leash has the same cost.
 - Run 27: msb's agentd (guest pid 1) holds copies of the caps in memory
   (16 matches), because caps are delivered through `msb exec` stdin. Root
   can read caps anyway (they are root-owned files). Only root can read

@@ -11,11 +11,11 @@
 # 10.0.2.x. Enforcement is in the msb process on the host, so there is no
 # guest firewall to flush -- we try anyway.
 #
-# Environment: LEASH_GW (gateway URL), CONTROL_PORT (a host port with a real
+# Environment: TETHER_GW (gateway URL), CONTROL_PORT (a host port with a real
 # listener, default 18002), HOST_LAN (the host's LAN IPv4, optional).
 set -uo pipefail
 
-GW=${LEASH_GW:-http://host.microsandbox.internal:18001}
+GW=${TETHER_GW:-http://host.microsandbox.internal:18001}
 GW_HOST=host.microsandbox.internal
 GW_IP=$(awk -v h="$GW_HOST" '$2 == h {print $1; exit}' /etc/hosts)
 GW_PORT=${GW##*:}
