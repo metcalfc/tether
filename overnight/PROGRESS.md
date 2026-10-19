@@ -6,24 +6,26 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 5 item 1 is done (run 16). **Next: milestone 5, item 2: a nono
-session profile per agent, command policies for git and npm, and cap
-delivery via tmpfs.** Re-read the design's "nono: capabilities inside the
-guest" (Must do, and seams 2-4) and the Policy model's `agents.claude.tools`.
-Boot the cage as in run 16 (env block below), run `cage.sh users`, then:
-mint caps per (agent) and per (agent, tool) with `tether cap mint`, write
-each into `/run/tether/<agent>/<tool>` as root (owner = that agent's UID,
-mode 0400, dir 0700), and work out how nono hands a cap to one tool only.
-First read nono 0.80.0's own docs/help in the guest (`/opt/nono/nono --help`,
-`nono run --help`, profile schema) to see whether the token broker /
-`GrantSet` / command policies (`cmd.<name>`) exist in this release and
-whether env promotion supports a templated value such as
-`HTTPS_PROXY=http://cap:{{token}}@host...`. If not, take the design's
-fallback: grant the cap file to one tool with `fs_read_file` and a
-three-line launcher. Session profile per agent: fs write `/work` + its home,
-`tcp_connect_ports: [18001]`. git: `argv_prepend -c core.hooksPath=/dev/null`,
-plus the `.git` finding from run 16 below. Script it as `cage.sh nono` (or
-extend `users`), and record what you ran and nono's per-command launch cost.
+Milestone 5 item 2 is done (run 17). **Next: milestone 5, item 3: verify one
+tool can't read another's capability through `/proc`.** Boot as below, then
+`spike/msb/cage.sh users && spike/msb/cage.sh nono` (setup, caps, 19-line
+check). Then, from claude's session sandbox (`nono.sh run claude bash -c
+...`), while a mediated `git clone` and `npm view` run in the background:
+read `/proc/<pid>/environ`, `/proc/<pid>/cmdline`, `/proc/<pid>/maps` and
+`/proc/<pid>/fd/*` of the git, git-remote-http and node processes (find pids
+by scanning `/proc/*/comm`), try `ptrace`/`process_vm_readv` (python ctypes)
+and `gdb`-less `/proc/<pid>/mem` reads, and grep for `tth_`. Expect Landlock's
+ptrace scoping to refuse environ/mem/fd (the tools run in sibling Landlock
+domains), and expect cmdline to be readable but cap-free (the cap is in a
+header from a file, not argv). Also do it from codex's session against
+claude's tools, and as a **control** run the same reads from an unsandboxed
+claude shell (`setpriv --reuid claude ...` without nono) to show it is
+Landlock, not Unix perms, doing the work. A second control: the leash-style
+env delivery (`GIT_CONFIG_KEY_0=url.http://agent:<cap>@...`) puts the cap in
+`git-remote-http`'s argv; show that `/proc/<pid>/cmdline` leaks it, which is
+why the gitconfig format uses a header. Script it as `nono.sh proc` +
+`cage.sh proc`. Record results in PROGRESS and keep `spike/RESULTS.md` for
+milestone 8.
 
 Cage env used in runs 11 and 16 (tether as the gateway, Landlock kernel):
 
@@ -689,7 +691,7 @@ Run 15 (2026-10-19) notes:
 ## 5. Identity in the guest
 
 - [x] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
-- [ ] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
+- [x] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
 - [ ] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
 
 Run 16 (2026-10-19) notes:
@@ -741,6 +743,91 @@ Run 16 (2026-10-19) notes:
   ownership).
 - Boot to first exec: 0.40 s. No model calls this run.
 
+Run 17 (2026-10-19) notes:
+
+- New: `spike/msb/guest/nono.sh` (`setup`, `put`, `run`, `check`) and
+  `cage.sh caps` / `cage.sh nono`. `cage.sh up` now mounts the guest nono
+  build at `/opt/nono` (`--mount-dir ...tether-guest/bin:/opt/nono:ro`).
+  tether: `cap mint --env -` (env file to stdout, so a cap goes host ->
+  pipe -> guest tmpfs and never touches host disk), `--format
+  env|gitconfig|npmrc`, `--no-route`/`--no-egress`, and `env_for` now
+  names only the cap's own grants (no proxy vars without egress, no git
+  rewrite without github, no `ANTHROPIC_*` without anthropic). 2 new unit
+  tests; tether 60/60, leash 14/14, ruff clean.
+- **Caps per boot:** for each agent, `agent` (env file; claude: route
+  anthropic + egress pypi/pythonhosted; codex: no route, egress pypi),
+  `git` (gitconfig; route github, no egress), `npm` (npmrc; no route, egress
+  registry.npmjs.org), all `--ttl 12h`. Stored as
+  `/run/tether/<agent>/<name>`, **`root:<agent>` 0440** in a `root:<agent>`
+  0750 dir. Deviation from "owner = agent, 0400": an owner can chmod its own
+  file (Landlock does not mediate chmod), root ownership with group read
+  cannot. `/run/tether` is now **0711** (was 0700): nono's supervisor runs as
+  the agent and must traverse to its own directory; listing is still denied
+  (`users.sh check` 18/18 PASS again).
+- **nono 0.80 findings (see the design's new Corrections section):**
+  - `command_policies` exist, with named credentials of type `local-socket`,
+    `raw-file`, `proxy`, `ambient`. No `GrantSet`/templated env. A
+    `raw-file` credential is a **file grant to one command sandbox**; it
+    does not set `env_var` (tried, including with `allow_vars`).
+  - **Exec gate:** a command sandbox may exec only its pinned executable
+    (and mediated commands). The design's "three-line launcher" therefore
+    fails (`exec: /usr/bin/git: Permission denied`); so do git's
+    `remote-https` and every `!alias`, pager, fsmonitor and filter.
+  - So each cap is a file in the tool's own format. git: pinned
+    `/usr/bin/git`, `argv_prepend -c core.hooksPath=/dev/null -c
+    core.fsmonitor=false -c include.path=/run/tether/<a>/git`; the file is
+    `[url "<gw>/github/"] insteadOf = https://github.com/` plus
+    `[http "<gw>/github/"] extraHeader = Authorization: Basic
+    base64(agent:<cap>)`. `git-remote-http` is a chained command
+    (`from.session: deny`, `from.git` with the same raw-file and
+    `allow_raw_file_credentials_in_chained_policy`), `GIT_EXEC_PATH` is an
+    empty dir so the helper resolves via the shim, and git's
+    `GIT_DIR`/`GIT_SHALLOW_FILE`/`GIT_CONFIG_PARAMETERS`/... pass `allow_vars`
+    (clone runs `index-pack` as a second git, which failed with
+    `--stdin requires a git repository` without them). npm: pinned
+    `/usr/local/bin/node` with `argv_prepend npm-cli.js --userconfig
+    /run/tether/<a>/npm` (`https-proxy=`/`proxy=` with the cap).
+  - nono refuses a grant of the whole home (overlaps
+    `~/.local/state/nono`) and of `~/.config` (overlaps its built-in
+    credential denies); session grants `/work`, `/tmp`, `~/.claude`,
+    `~/.cache`, `~/.npm`, `~/.claude.json`, read `/usr /etc /opt/nono
+    /opt/tether`, `network.connect_port: [18001]`.
+- **`cage.sh nono` check: 19/19 PASS** (claude; plus a codex sanity run):
+  - Session: Landlock V6 on, writes `/work`, cannot write the rest of its
+    home, **cannot read any file in its own `/run/tether/claude/`** (Unix
+    perms would allow; Landlock refuses), holds its own cap in env and no
+    git rewrite, **EACCES connecting to a real listener on guest
+    127.0.0.1:8080**, reaches the gateway, and its own cap is refused a
+    CONNECT to registry.npmjs.org (`cap:egress-grant`).
+  - git: clone of `metcalfc/tether-scratch` works; `metcalfc/imp` gets 403
+    (route allowlist); hooksPath is `/dev/null`; **planted `core.pager`,
+    `alias.x=!...`, `core.fsmonitor` and a `filter.*.clean` driver in
+    `.git/config` all fail to run** (exec gate) -- this closes run 16's
+    cross-agent `.git` code-execution path for mediated git; **direct
+    `/usr/bin/git` from the session: Permission denied**.
+  - npm: `npm view left-pad` = 1.3.0 through the npm cap; **interpreter
+    bypass** (`node .../npm-cli.js view`) gets `403` -- tether's audit shows
+    it arrived with the agent's cap and was refused by its egress grant
+    (seam 4 fails closed). Plain `node` still runs in the session (Claude
+    Code needs it); only `npm` by name is mediated.
+  - codex cannot read claude's git cap; codex's own session clones with
+    its own git cap.
+  - **tether's audit attributes each request:** `claude git`, `claude npm`,
+    `codex git`, and `claude -` for the agent-cap refusals.
+- **Known gap (recorded, not fixed):** the agent can print its git cap
+  through git itself (`git config --get-regexp extraheader`). Per-tool caps
+  keep a tool's cap from *other tools* (by policy an npm script can neither read it nor run
+  git, as there is no `from.npm` edge -- untested until milestone 7) and give attribution; they do not hide it from
+  the agent that drives the tool. The cap only buys what git's grant allows.
+- **Not done here:** npm lifecycle scripts (`sh -c` from node) will hit the
+  exec gate; `npm install` of a package with a postinstall will fail rather
+  than run it. That is milestone 7's fixture; add a `sh` edge
+  (`commands.sh.from.npm`, no cap, no network) only if a legit install needs
+  it.
+- **Launch cost:** session start (`nono run -- true`) **165 ms**; mediated
+  `git --version` **24 ms/call** vs <1 ms plain (10 runs each).
+- Boot to first exec 0.42 s. No model calls this run.
+
 ## 6. Compiler and conformance
 
 - [ ] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
@@ -785,3 +872,10 @@ Run 16 (2026-10-19) notes:
   xattrs (no `setfacl` in the image, no deb.debian.org egress). Shared
   `/work` lets one agent write another's `.git/`, so `.git` writes must be
   limited to the owning agent's git (item 2); `safe.directory=*` is not used.
+- Run 17: Landlock cannot carve `.git` out of `/work` (nono refuses the
+  overlapping deny); instead nono's exec gate stops planted git config from
+  running anything. nono 0.80 `raw-file` credentials are file grants, not
+  env; launchers cannot exec the tool; caps go to tools as their own config
+  files (gitconfig with an `http.extraHeader`, npmrc). Cap files are
+  `root:<agent>` 0440, `/run/tether` 0711. Design doc now has a
+  Corrections section.

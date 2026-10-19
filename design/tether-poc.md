@@ -543,3 +543,15 @@ Local source and docs are cited inline by path. Web sources, checked Oct 18, 202
 - Kong: Claude Code through AI Gateway: https://developer.konghq.com/ai-gateway/v1/how-to/use-claude-code-with-ai-gateway-anthropic/
 - Vendor survey of gateways (Maxim, makers of Bifrost): https://www.getmaxim.ai/articles/top-5-open-source-claude-code-gateways-in-2026/
 - Codex WebSocket fallback report: https://github.com/openai/codex/issues/13041
+
+## Corrections
+
+Found while building the PoC (Oct 18–19, 2026). The code wins; details are in `overnight/PROGRESS.md`.
+
+- **libkrunfw:** microsandbox's kernel is its fork `superradcompany/libkrunfw` (5.6.1, Linux 6.12.111), not `containers/libkrunfw`. Built with Landlock it reports ABI V6; the day-2 gate passed.
+- **`deny: [/work/.git]` inside a `/work` grant cannot work on Linux.** Landlock has no deny; nono refuses to start on a deny that overlaps an allow. The cross-agent `.git` risk (one agent planting `core.fsmonitor`, `core.pager`, aliases or filters for another) is closed instead by nono's exec gate: a command sandbox may exec only its pinned executable and mediated commands, so planted config cannot run anything.
+- **Seam 2, cap delivery.** nono 0.80 has command policies (`command_policies.commands.<name>`) and named credentials (`local-socket`, `raw-file`, `proxy`, `ambient`). There is no templated env promotion. A `raw-file` credential grants one file to one command sandbox; it does not put the file in the environment. The "three-line launcher" fallback also fails: the launcher cannot exec the real tool. What works is a cap file in the tool's own format: `git -c include.path=<file>` (a url rewrite plus an `http.extraHeader`) and `npm --userconfig <file>`. tether emits both (`tether cap mint --format gitconfig|npmrc --env -`).
+- **git under a command policy** also needs its remote helper (`git-remote-http`, since the rewrite points at the plain-HTTP gateway) as a chained command with the same file, `GIT_EXEC_PATH` pointed at an empty directory so the helper resolves through nono's shim, and git's own `GIT_DIR`-style variables allowed through (clone runs `index-pack` as a second git).
+- **The cap rides in a header, not URL userinfo,** because git passes the rewritten URL to `git-remote-http` as argv, and `/proc/<pid>/cmdline` is readable by every process.
+- **Per-tool caps do not hide a tool's cap from the agent driving that tool:** `git config --get-regexp extraheader` prints it. They keep it from other tools (an npm script cannot read git's cap or run git) and give per-tool attribution in tether's audit.
+- **A session profile cannot grant the whole home directory** (it overlaps nono's state root, `~/.local/state/nono`), nor `~/.config` (it overlaps nono's built-in credential denies). The profile grants `~/.claude`, `~/.cache`, `~/.npm` and `~/.claude.json`.

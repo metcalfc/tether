@@ -406,49 +406,92 @@ class Registry:
         return out
 
 
-def env_for(policy: Policy, cap: str, advertise: str | None = None) -> dict[str, str]:
+def env_for(
+    policy: Policy,
+    cap: str,
+    advertise: str | None = None,
+    routes: list[str] | None = None,
+    egress: list[str] | None = None,
+) -> dict[str, str]:
     """What the agent's machine gets. Nothing in here is a credential: each
     value is worthless anywhere but through this gateway, on its own
-    sandbox's listener."""
+    sandbox's listener. `routes` and `egress` are the cap's grants (None:
+    the whole policy), so a tool's env names only what its cap can use: no
+    proxy for a cap with no egress, no git rewrite for a cap without github."""
     advertise = advertise or policy.advertise
     adv = urllib.parse.urlsplit(advertise)
     host = adv.netloc
     authed = f"{adv.scheme}://agent:{cap}@{host}"
-    env = {
-        "TETHER_CAPABILITY": cap,
-        "HTTPS_PROXY": authed,
-        "HTTP_PROXY": authed,
-        "https_proxy": authed,
-        "http_proxy": authed,
-        "NO_PROXY": adv.hostname or "",
-        "no_proxy": adv.hostname or "",
+    env = {"TETHER_CAPABILITY": cap}
+    if egress is None or egress:
+        for k in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"):
+            env[k] = authed
+    env["NO_PROXY"] = env["no_proxy"] = adv.hostname or ""
+    granted = [r for r in policy.routes if routes is None or r in routes]
+    if "anthropic" in granted:
         # Claude Code otherwise phones home for telemetry and updates, which
         # the allowlist would refuse -- noise in the audit log, not a threat.
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    }
-    if "anthropic" in policy.routes:
+        env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         env["ANTHROPIC_BASE_URL"] = f"{advertise}/anthropic"
         env["ANTHROPIC_AUTH_TOKEN"] = cap
-    if "openai" in policy.routes:
+    if "openai" in granted:
         env["OPENAI_BASE_URL"] = f"{advertise}/openai/v1"
         env["OPENAI_API_KEY"] = cap
-    if "github" in policy.routes:
+    if "github" in granted:
         # git sees https://github.com/... and quietly talks to the gateway.
         env["GIT_CONFIG_COUNT"] = "1"
         env["GIT_CONFIG_KEY_0"] = f"url.{authed}/github/.insteadOf"
         env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
-    if "github-api" in policy.routes:
+    if "github-api" in granted:
         env["GH_HOST"] = "github.com"
         env["GITHUB_API_URL"] = f"{advertise}/github-api"
     return env
 
 
-def write_env_file(policy: Policy, path: Path, cap: str, rec: dict[str, Any]) -> Path:
+CAP_FORMATS = ("env", "gitconfig", "npmrc")
+
+
+def cap_file_body(policy: Policy, cap: str, rec: dict[str, Any], fmt: str = "env") -> str:
+    """A cap in the shape its consumer reads. `env` is leash's env file. The
+    tool formats are files a tool reads itself, for a sandbox (nono) that can
+    grant one file to one tool but not put a secret in its environment:
+    `gitconfig` (git -c include.path=...) carries the cap in an
+    http.extraHeader rather than in URL userinfo, because git hands the
+    rewritten URL to git-remote-http as argv, and /proc/<pid>/cmdline is
+    readable by every process; `npmrc` (npm --userconfig ...) sets npm's
+    proxy, which npm uses in-process."""
+    sb = policy.sandboxes[rec["sandbox"]]
+    adv = urllib.parse.urlsplit(sb.advertise)
+    routes, egress = rec.get("routes"), rec.get("egress")
+    if fmt == "gitconfig":
+        if "github" not in policy.routes or (routes is not None and "github" not in routes):
+            raise ValueError("a gitconfig cap needs the github route")
+        base = f"{sb.advertise}/github/"
+        auth = base64.b64encode(f"agent:{cap}".encode()).decode()
+        return (
+            f'[url "{base}"]\n\tinsteadOf = https://github.com/\n'
+            f'[http "{base}"]\n\textraHeader = Authorization: Basic {auth}\n'
+        )
+    if fmt == "npmrc":
+        if egress is not None and not egress:
+            raise ValueError("an npmrc cap needs an egress grant")
+        authed = f"{adv.scheme}://agent:{cap}@{adv.netloc}"
+        return f"https-proxy={authed}\nproxy={authed}\nnoproxy={adv.hostname}\n"
+    env = env_for(policy, cap, sb.advertise, routes, egress)
+    return "\n".join(f"{k}={v}" for k, v in env.items()) + "\n"
+
+
+def write_env_file(policy: Policy, path: Path, cap: str, rec: dict[str, Any], fmt: str = "env") -> Path:
     sb = policy.sandboxes[rec["sandbox"]]
     who = "/".join(x for x in (rec["session"], rec.get("agent"), rec.get("tool")) if x)
-    lines = [f"{k}={v}" for k, v in env_for(policy, cap, sb.advertise).items()]
-    body = "\n".join(lines)
-    head = f"# tether {rec['cap_id']} for {who} (sandbox {sb.name}) -- capabilities only, no credentials"
+    body = cap_file_body(policy, cap, rec, fmt).rstrip("\n")
+    mark = ";" if fmt == "npmrc" else "#"
+    head = f"{mark} tether {rec['cap_id']} for {who} (sandbox {sb.name}) -- capabilities only, no credentials"
+    if str(path) == "-":
+        # Straight into a pipe (e.g. into the guest), so the cap is never on the host's disk.
+        sys.stdout.write(f"{head}\n{body}\n")
+        sys.stdout.flush()
+        return path
     path.write_text(f"{head}\n{body}\n")
     path.chmod(0o600)
     return path
@@ -1655,23 +1698,32 @@ def cmd_cap(policy: Policy, args: argparse.Namespace) -> None:
             raise SystemExit(f"tether: no sandbox {sandbox!r} (session {args.session!r} is in none)")
         if args.session not in policy.sandboxes[sandbox].sessions:
             raise SystemExit(f"tether: session {args.session!r} is not in sandbox {sandbox!r}")
-        egress = [h.lower() for h in args.egress] if args.egress else None
-        errs = grant_errors(policy, args.route, egress, args.spend)
+        if (args.no_egress and args.egress) or (args.no_route and args.route):
+            raise SystemExit("tether: --no-route/--no-egress contradict --route/--egress")
+        egress = [] if args.no_egress else [h.lower() for h in args.egress] if args.egress else None
+        routes = [] if args.no_route else args.route
+        errs = grant_errors(policy, routes, egress, args.spend)
+        if args.format != "env" and not args.env:
+            errs.append(f"--format {args.format} needs --env PATH (or -)")
+        try:  # refuse a format the grants can't fill before minting anything
+            cap_file_body(policy, "tth_probe", {"sandbox": sandbox, "routes": routes, "egress": egress}, args.format)
+        except ValueError as e:
+            errs.append(str(e))
         if errs:
-            raise SystemExit("tether: cap must fit inside the ceiling: " + "; ".join(errs))
+            raise SystemExit("tether: refusing to mint: " + "; ".join(errs))
         cap, rec = reg.mint(
             sandbox,
             args.session,
             agent=args.agent,
             tool=args.tool,
             human=args.human,
-            routes=args.route,
+            routes=routes,
             egress=egress,
             spend_usd=args.spend,
             ttl_secs=parse_ttl(args.ttl) if args.ttl else None,
         )
         if args.env:
-            write_env_file(policy, args.env, cap, rec)
+            write_env_file(policy, args.env, cap, rec, args.format)
             log(f"minted {rec['cap_id']} for sandbox {sandbox}, wrote {args.env}")
         else:
             log(f"minted {rec['cap_id']} for sandbox {sandbox}")
@@ -1814,7 +1866,10 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--egress", action="append", help="limit to this host pattern (repeatable)")
     m.add_argument("--spend", type=float, help="spend sub-cap, USD per day")
     m.add_argument("--ttl", help="lifetime, e.g. 90s, 30m, 8h, 2d")
-    m.add_argument("--env", type=Path, help="write an env file (0600) instead of printing the cap")
+    m.add_argument("--no-route", action="store_true", help="no routes at all (a CONNECT-only tool)")
+    m.add_argument("--no-egress", action="store_true", help="no CONNECT egress at all (a routes-only tool)")
+    m.add_argument("--env", type=Path, help="write an env file (0600) instead of printing the cap; - for stdout")
+    m.add_argument("--format", choices=CAP_FORMATS, default="env", help="shape of the --env file (default env)")
     r = csub.add_parser("revoke", help="revoke caps; takes effect on the next request")
     r.add_argument("cap_id", nargs="*")
     r.add_argument("--sandbox")

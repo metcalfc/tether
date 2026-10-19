@@ -78,11 +78,12 @@ cmd_setup() {
   chmod 2775 /work
   acl /work set >/dev/null
 
-  # Caps arrive here later. Root only: the per-tool delivery (milestone 5,
-  # item 2) hands each tool its own file, not the directory.
+  # Caps live in /run/tether/<agent>/ (nono.sh). 0711: an agent may pass
+  # through to its own directory, where nono's supervisor (running as the
+  # agent) reads a tool's cap, but may not list or write the parent.
   mkdir -p /run/tether
   chown root:root /run/tether
-  chmod 700 /run/tether
+  chmod 711 /run/tether
   log "users: $(for a in $AGENTS $HUMAN; do printf '%s ' "$(id "$a")"; done)"
   log "/work: $(stat -c '%U:%G %a' /work)"
   acl /work show
@@ -104,7 +105,7 @@ cmd_check() {
   set -- $AGENTS
   a=$1 b=$2
   rm -rf /work/.users-check /work-noacl
-  echo "root-only probe" >/run/tether/probe
+  echo "root-only probe" >/run/tether/probe; chmod 600 /run/tether/probe
   echo "secret of $a" >"/home/$a/secret"; chown "$a:$a" "/home/$a/secret"
   echo "secret of $b" >"/home/$b/secret"; chown "$b:$b" "/home/$b/secret"
 

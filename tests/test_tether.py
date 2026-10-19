@@ -22,6 +22,7 @@ import tempfile
 import threading
 import time
 import tracemalloc
+import types
 import unittest
 import urllib.parse
 from pathlib import Path
@@ -1071,6 +1072,58 @@ class RegistryTest(TwoSandboxes):
         self.assertNotIn(cap, reg)
         self.assertNotIn(self.caps["o1"], reg)
         self.assertEqual(oct((self.policy.state_dir / "caps.json").stat().st_mode & 0o777), "0o600")
+
+    def test_tool_env_names_only_its_grants(self) -> None:
+        # A routes-only tool gets no proxy; a CONNECT-only tool gets no route vars.
+        before = sorted(self.policy.state_dir.glob("*.env"))
+        out = self.cli("cap", "mint", "--session", "o1", "--tool", "x", "--no-egress", "--env", "-")
+        env = dict(line.split("=", 1) for line in out.splitlines() if not line.startswith("#"))
+        self.assertTrue(out.startswith("# tether cap_"))
+        self.assertIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("HTTPS_PROXY", env)
+        self.assertEqual(self.post("other", env["TETHER_CAPABILITY"]), 200)
+        self.assertIn(b"403", self.connect("other", env["TETHER_CAPABILITY"]))
+        out = self.cli("cap", "mint", "--session", "o1", "--tool", "npm", "--no-route", "--env", "-")
+        env = dict(line.split("=", 1) for line in out.splitlines() if not line.startswith("#"))
+        self.assertIn("HTTPS_PROXY", env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertNotIn("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", env)
+        self.assertEqual(self.post("other", env["TETHER_CAPABILITY"]), 403)
+        # --env - writes to stdout only: no env file lands on the host
+        self.assertEqual(sorted(self.policy.state_dir.glob("*.env")), before)
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.cli("cap", "mint", "--session", "o1", "--no-route", "--route", "anthropic")
+        # git's rewrite follows the github grant, not the policy's route list
+        pol = types.SimpleNamespace(advertise="http://gw:1", routes={"anthropic": 0, "github": 0})
+        self.assertIn("GIT_CONFIG_KEY_0", tether.env_for(pol, "tth_x", routes=["github"]))  # type: ignore[arg-type]
+        self.assertNotIn("GIT_CONFIG_KEY_0", tether.env_for(pol, "tth_x", routes=["anthropic"]))  # type: ignore[arg-type]
+        self.assertIn("GIT_CONFIG_KEY_0", tether.env_for(pol, "tth_x"))  # type: ignore[arg-type]
+
+    def test_tool_native_cap_files(self) -> None:
+        sb = types.SimpleNamespace(advertise="http://gw.internal:18001")
+        pol = types.SimpleNamespace(sandboxes={"s": sb}, routes={"github": 0, "anthropic": 0})
+        rec = {"sandbox": "s", "routes": ["github"], "egress": []}
+        git = tether.cap_file_body(pol, "tth_secret", rec, "gitconfig")  # type: ignore[arg-type]
+        self.assertIn('[url "http://gw.internal:18001/github/"]\n\tinsteadOf = https://github.com/', git)
+        # the cap rides in a header, never in the URL git passes to its remote helper's argv
+        self.assertNotIn("tth_secret@", git)
+        b64 = base64.b64encode(b"agent:tth_secret").decode()
+        self.assertIn(f'[http "http://gw.internal:18001/github/"]\n\textraHeader = Authorization: Basic {b64}', git)
+        npm = tether.cap_file_body(pol, "tth_secret", {"sandbox": "s", "routes": [], "egress": ["r.example"]}, "npmrc")  # type: ignore[arg-type]
+        self.assertIn("https-proxy=http://agent:tth_secret@gw.internal:18001\n", npm)
+        self.assertIn("noproxy=gw.internal\n", npm)
+        with self.assertRaises(ValueError):
+            tether.cap_file_body(pol, "c", {"sandbox": "s", "routes": ["anthropic"], "egress": None}, "gitconfig")  # type: ignore[arg-type]
+        with self.assertRaises(ValueError):
+            tether.cap_file_body(pol, "c", rec, "npmrc")  # type: ignore[arg-type]
+        # the CLI refuses before minting: this policy has no github route
+        n = len(json.loads(self.cli("cap", "list", "--json")))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            self.cli("cap", "mint", "--session", "o1", "--tool", "git", "--format", "gitconfig", "--env", "-")
+        self.assertEqual(len(json.loads(self.cli("cap", "list", "--json"))), n)
+        out = self.cli("cap", "mint", "--session", "o1", "--tool", "npm", "--format", "npmrc", "--env", "-")
+        self.assertTrue(out.startswith("; tether cap_"))
+        self.assertIn("https-proxy=http://agent:tth_", out)
 
     def test_list_shows_records_never_caps(self) -> None:
         cap = self.cli("cap", "mint", "--session", "o2", "--tool", "npm").strip()

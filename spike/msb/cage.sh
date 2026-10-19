@@ -19,12 +19,17 @@
 #   cage.sh works      run guest/works.sh
 #   cage.sh users      per-agent users and a shared /work (guest/users.sh
 #                      setup), then prove it (users.sh check)
+#   cage.sh caps       mint one cap per agent and per (agent, tool) and pipe
+#                      each into the guest's /run/tether (never on host disk)
+#   cage.sh nono       nono profiles + launchers (guest/nono.sh setup), caps,
+#                      then prove them (nono.sh check); run `users` first
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
 # Environment: CAGE_NAME (tether-cage), CAGE_IMAGE (node:22-bookworm),
 # CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001),
-# CAGE_MODEL (claude-haiku-4-5, for works).
+# CAGE_MODEL (claude-haiku-4-5, for works), CAGE_AGENTS ("claude codex"),
+# CAGE_NONO_DIR (~/.microsandbox/tether-guest/bin, mounted at /opt/nono).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -40,6 +45,8 @@ GW_PID=$RUN/cage-gw.pid
 GW_LOG=$RUN/cage-gw.log
 GUEST_ENV=/root/.leash.env
 GUEST_DIR=/opt/leash
+# The guest build of nono (linux aarch64, glibc), mounted read-only at /opt/nono.
+NONO_DIR=${CAGE_NONO_DIR:-$HOME/.microsandbox/tether-guest/bin}
 
 log() { printf '[cage] %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
@@ -86,7 +93,8 @@ cmd_up() {
   limit 300 "$MSB" create "$IMAGE" --name "$NAME" -q \
     --cpus 4 --memory 4G \
     --net-default deny --net-rule "allow@host:tcp:$PORT" \
-    --tmpfs /run/tether
+    --tmpfs /run/tether \
+    --mount-dir "$NONO_DIR:/opt/nono:ro"
   limit 60 "$MSB" exec "$NAME" -- true
   t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
   log "boot to first exec: $(perl -e 'printf "%.2f", $ARGV[1]-$ARGV[0]' "$t0" "$t1")s"
@@ -169,6 +177,53 @@ cmd_users() {
   limit 120 "$MSB" exec "$NAME" --no-stdin -- "$GUEST_DIR/users.sh" check
 }
 
+# Grants per agent and per tool. The agent's own cap rides in its session's
+# environment; a tool's cap is a file only that tool's command sandbox reads.
+CAGE_AGENTS=${CAGE_AGENTS:-claude codex}
+agent_grants() {
+  case $1 in
+    claude) echo "--route anthropic --egress pypi.org --egress files.pythonhosted.org" ;;
+    *) echo "--no-route --egress pypi.org" ;;
+  esac
+}
+tool_grants() {
+  case $1 in
+    git) echo "--route github --no-egress" ;;
+    npm) echo "--no-route --egress registry.npmjs.org" ;;
+  esac
+}
+
+put_cap() { # put_cap AGENT NAME GRANTS...: mint, and pipe the env file straight into the guest
+  local a=$1 name=$2; shift 2
+  local tool=() fmt=env
+  case $name in
+    agent) ;;
+    git) tool=(--tool git); fmt=gitconfig ;;  # read by git -c include.path
+    npm) tool=(--tool npm); fmt=npmrc ;;      # read by npm --userconfig
+    *) tool=(--tool "$name") ;;
+  esac
+  "$GW" -c "$POLICY" cap mint --session cage --agent "$a" "${tool[@]}" --ttl 12h "$@" --format "$fmt" --env - |
+    limit 60 "$MSB" exec "$NAME" -- "$GUEST_DIR/nono.sh" put "$a" "$name"
+}
+
+cmd_caps() {
+  local a t
+  for a in $CAGE_AGENTS; do
+    # shellcheck disable=SC2046 # grants are flag lists
+    put_cap "$a" agent $(agent_grants "$a")
+    for t in git npm; do
+      # shellcheck disable=SC2046
+      put_cap "$a" "$t" $(tool_grants "$t")
+    done
+  done
+}
+
+cmd_nono() {
+  limit 120 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" setup
+  cmd_caps
+  limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" check
+}
+
 cmd_down() {
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
@@ -184,7 +239,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  gw-up | gw-down | up | check | push | attack | works | users | down | status) "cmd_${1//-/_}" ;;
+  gw-up | gw-down | up | check | push | attack | works | users | caps | nono | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,27p' "$0"; exit 2 ;;
+  *) sed -n '2,32p' "$0"; exit 2 ;;
 esac
