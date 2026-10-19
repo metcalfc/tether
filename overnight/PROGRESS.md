@@ -6,22 +6,11 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 8 items 1 and 2 are done (run 28: the demo is recorded to
-`overnight/run/poc-demo.mp4`). **Next: milestone 8, item 3:
-`overnight/REPORT.md`** (one page at most: what works and what doesn't,
-what was faked or skipped, the acceptance table and numbers from the
-`spike/RESULTS.md` PoC section, fallbacks (none), and the three things to
-look at first). Then item 4: run the real-key `git grep`s from PROMPT.md,
-`make test`, push `poc/tether`, and open a draft PR (`gh pr create --draft`)
-whose body is REPORT.md plus "how to run it" (the demo:
-`vhs spike/record/poc-demo.tape`, or `spike/msb/demo.sh setup`, then `1`
-through `10`, then `teardown`). Then write `DONE` to `overnight/STATUS`.
-
-Candidates for "look at first": (1) reservations vs Claude Code's default
-model ($3.20 reserved a call, more than the $2 cap; run 28); (2) the
-`git-remote-http -> git` push edge, which runs 17-27 missed; (3) per-tool
-caps give attribution but don't hide a tool's cap from the agent driving
-it (run 17), plus agentd holding caps (run 27).
+**All done (run 29).** Every item is ticked, `overnight/REPORT.md` is
+written, `poc/tether` is pushed, and the draft PR is
+https://github.com/metcalfc/tether/pull/1 (base `spike/mac-lockdown`,
+because the remote has no `main`). `overnight/STATUS` says `DONE`. Nothing
+is left for the loop to do.
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -1282,9 +1271,9 @@ Run 26 (2026-10-19) notes:
 
 - [x] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
 - [x] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
-- [ ] `overnight/REPORT.md` written
-- [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
-- [ ] `DONE` written to `overnight/STATUS`
+- [x] `overnight/REPORT.md` written
+- [x] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
+- [x] `DONE` written to `overnight/STATUS`
 
 Run 27 (2026-10-19) notes:
 
@@ -1382,6 +1371,20 @@ Run 28 (2026-10-19) notes:
   `/github/metcalfc/imp` (refused by the route paths).
 - Haiku dry run of step 4 (before the push fix): it fixed the bug, and the
   push failed with the nono chain error, which is how finding 1 surfaced.
+
+Run 29 (2026-10-19) notes:
+
+- Wrote `overnight/REPORT.md` (one page: what works, the acceptance table,
+  numbers, what was skipped, no fallbacks, and three things to look at
+  first). The night's model spend comes to about $0.74 (the spend log below).
+- Checks before the push: `make test` 95 OK; ruff clean; both of
+  PROMPT.md's `git grep`s are clean (`gho_` only hits regex patterns and
+  prose; `gho_[A-Za-z0-9]{30,}` matches nothing); `git log -p main..HEAD`
+  has no real-key shapes.
+- Pushed `poc/tether`. The remote only had `spike/mac-lockdown` (no
+  `main`), so the draft PR targets that: https://github.com/metcalfc/tether/pull/1.
+  Its body is REPORT.md, which ends with "How to run it".
+- No model calls this run.
 
 ## Spend log
 
