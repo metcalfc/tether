@@ -936,6 +936,63 @@ class TetherTest(unittest.TestCase):
         tether.cmd_report(self.policy, as_json=False)
 
 
+class ReportByTool(unittest.TestCase):
+    LINES = [
+        {"ts": "2026-10-19T01:00:00-07:00", "decision": "allow", "session": "cage", "agent": "claude",
+         "model": "claude-haiku-4-5", "tokens": {"in": 100, "cr": 50, "out": 10}, "usd": 0.25},
+        {"ts": "2026-10-18T23:00:00-07:00", "decision": "allow", "session": "cage", "agent": "claude",
+         "tokens": {"in": 1, "out": 1}, "usd": 0.5},
+        {"ts": "2026-10-19T01:00:01-07:00", "decision": "allow", "session": "cage", "agent": "claude", "tool": "git"},
+        {"ts": "2026-10-19T01:00:02-07:00", "decision": "deny", "rule": "cap:route-grant", "session": "cage",
+         "agent": "claude", "tool": "git"},
+        {"ts": "2026-10-19T01:00:03-07:00", "decision": "deny", "rule": "egress:default", "session": "cage",
+         "agent": "codex", "tool": "npm", "host": "evil.example:443"},
+        {"ts": "2026-10-19T01:00:04-07:00", "decision": "allow", "session": "other"},
+    ]
+
+    def lines(self) -> list[str]:
+        return [json.dumps(r) for r in self.LINES] + ["not json", "[1]"]
+
+    def test_one_row_per_agent_and_tool(self) -> None:
+        rows = tether.report_rows(self.lines(), "tool", "2026-10-19")
+        self.assertEqual(
+            sorted(rows),
+            [("cage", "claude", "-"), ("cage", "claude", "git"), ("cage", "codex", "npm"), ("other", "-", "-")],
+        )
+        model = rows[("cage", "claude", "-")]
+        self.assertEqual((model["requests"], model["in"], model["out"]), (2, 151, 11))
+        self.assertAlmostEqual(model["usd"], 0.75)
+        self.assertAlmostEqual(model["usd_today"], 0.25)
+        git = rows[("cage", "claude", "git")]
+        self.assertEqual((git["requests"], git["denied"], git["usd"]), (2, 1, 0.0))
+        self.assertEqual(dict(git["denied_by"]), {"cap:route-grant": 1})
+
+    def test_by_session_folds_tools(self) -> None:
+        rows = tether.report_rows(self.lines(), "session", "2026-10-19")
+        self.assertEqual(sorted(rows), [("cage",), ("other",)])
+        self.assertEqual((rows[("cage",)]["requests"], rows[("cage",)]["denied"]), (5, 2))
+
+    def test_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            state = Path(d) / "state"
+            state.mkdir()
+            (state / "audit.jsonl").write_text("\n".join(self.lines()) + "\n")
+            cfg = Path(d) / "policy.json"
+            cfg.write_text(json.dumps({"state_dir": str(state), "sessions": {}, "routes": {}}))
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tether.main(["-c", str(cfg), "report", "--by", "tool", "--json"])
+            got = json.loads(out.getvalue())
+            self.assertEqual(len(got), 4)
+            self.assertEqual(got[2]["agent"], "codex")
+            self.assertEqual(got[2]["tool"], "npm")
+            self.assertEqual(got[2]["denied_by"], {"egress:default": 1})
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                tether.main(["-c", str(cfg), "report", "--by", "tool"])
+            text = out.getvalue()
+            self.assertRegex(text, r"cage\s+claude\s+git\s+2\s+1\b")
+            self.assertIn("evil.example:443", text)
+
+
 class TwoSandboxes(unittest.TestCase):
     """Fixture: two sandboxes, two listeners, one gateway."""
 

@@ -28,6 +28,7 @@ Stdlib only. Python 3.10+.
     tether cap    -c policy.json   mint|revoke|list|boot capabilities (live, no restart)
     tether serve  -c policy.json   run the gateway
     tether report -c policy.json   spend and denials per session, from the audit log
+    tether report --by tool        one line per (session, agent, tool), with spend
     tether audit  -c policy.json   verify: walk the audit's hash chain; exit 1 at the first break
     tether compile POLICY -o DIR   one rl/poc-1 policy -> msb flags, nono profiles, tether config
 """
@@ -2329,43 +2330,83 @@ def cmd_serve(policy: Policy) -> None:
         log("stopped -- every capability is inert until the gateway is back")
 
 
-def cmd_report(policy: Policy, as_json: bool) -> None:
-    f = policy.state_dir / "audit.jsonl"
-    if not f.exists():
-        print("no audit log yet")
-        return
-    day = today()
-    rows: dict[str, dict[str, Any]] = defaultdict(
-        lambda: {"requests": 0, "denied": 0, "usd_today": 0.0, "in": 0, "out": 0, "models": Counter(), "last": ""}
+REPORT_KEYS = {"session": ("session",), "tool": ("session", "agent", "tool")}
+
+
+def report_rows(lines: list[str], by: str = "session", day: str = "") -> dict[tuple[str, ...], dict[str, Any]]:
+    """Fold audit lines into one row per `by` key: requests, denials, tokens, USD.
+
+    `usd` is everything the log charged; `usd_today` only `day`'s lines. A
+    request with no agent or tool (a session cap, a route with no tool) groups
+    under "-"."""
+    keys = REPORT_KEYS[by]
+    rows: dict[tuple[str, ...], dict[str, Any]] = defaultdict(
+        lambda: {"requests": 0, "denied": 0, "usd": 0.0, "usd_today": 0.0, "in": 0, "out": 0,
+                 "models": Counter(), "denied_by": Counter(), "last": ""}
     )
-    denied_hosts: Counter[str] = Counter()
-    for line in f.read_text().splitlines():
+    for line in lines:
         try:
             r = json.loads(line)
         except ValueError:
             continue
-        s = rows[r.get("session", "-")]
+        if not isinstance(r, dict):
+            continue
+        s = rows[tuple(str(r.get(k) or "-") for k in keys)]
         s["requests"] += 1
         s["last"] = max(s["last"], r.get("ts", ""))
         if r.get("decision") == "deny":
             s["denied"] += 1
-            denied_hosts[r.get("host") or f"/{r.get('route')}{r.get('path', '')}"] += 1
-        if r.get("ts", "").startswith(day) and r.get("usd"):
-            s["usd_today"] += r["usd"]
+            s["denied_by"][r.get("rule") or "-"] += 1
+        if r.get("usd"):
+            s["usd"] += r["usd"]
+            if day and r.get("ts", "").startswith(day):
+                s["usd_today"] += r["usd"]
         t = r.get("tokens") or {}
         s["in"] += t.get("in", 0) + t.get("cw", 0) + t.get("cr", 0)
         s["out"] += t.get("out", 0)
         if r.get("model"):
             s["models"][r["model"]] += 1
+    return dict(rows)
+
+
+def cmd_report(policy: Policy, as_json: bool, by: str = "session") -> None:
+    f = policy.state_dir / "audit.jsonl"
+    if not f.exists():
+        print("no audit log yet")
+        return
+    lines = f.read_text().splitlines()
+    rows = report_rows(lines, by, today())
     if as_json:
-        print(json.dumps({k: {**v, "models": dict(v["models"])} for k, v in rows.items()}, indent=2))
+        out = [
+            {**dict(zip(REPORT_KEYS[by], k, strict=True)), **v,
+             "models": dict(v["models"]), "denied_by": dict(v["denied_by"])}
+            for k, v in sorted(rows.items())
+        ]
+        print(json.dumps(out, indent=2))
         return
     cap = f" / ${policy.cap_session:.2f}" if policy.cap_session is not None else ""
-    print(f"{'SESSION':<20} {'REQS':>5} {'DENIED':>6} {'TOKENS IN/OUT':>16} {'SPEND TODAY':>18}  LAST SEEN")
-    for name, s in sorted(rows.items()):
-        toks = f"{s['in']}/{s['out']}"
-        spend = f"${s['usd_today']:.4f}{cap if name != '-' else ''}"
-        print(f"{name:<20} {s['requests']:>5} {s['denied']:>6} {toks:>16} {spend:>18}  {s['last'][11:19]}")
+    if by == "tool":
+        print(f"{'SESSION':<14} {'AGENT':<10} {'TOOL':<6} {'REQS':>5} {'DENIED':>6} {'TOKENS IN/OUT':>16} "
+              f"{'USD':>10} {'TODAY':>10}  LAST SEEN")
+        for (sess, agent, tool), s in sorted(rows.items()):
+            toks = f"{s['in']}/{s['out']}"
+            print(f"{sess:<14} {agent:<10} {tool:<6} {s['requests']:>5} {s['denied']:>6} {toks:>16} "
+                  f"{'$' + format(s['usd'], '.4f'):>10} {'$' + format(s['usd_today'], '.4f'):>10}  {s['last'][11:19]}")
+    else:
+        print(f"{'SESSION':<20} {'REQS':>5} {'DENIED':>6} {'TOKENS IN/OUT':>16} {'SPEND TODAY':>18}  LAST SEEN")
+        for (name,), s in sorted(rows.items()):
+            toks = f"{s['in']}/{s['out']}"
+            spend = f"${s['usd_today']:.4f}{cap if name != '-' else ''}"
+            print(f"{name:<20} {s['requests']:>5} {s['denied']:>6} {toks:>16} {spend:>18}  {s['last'][11:19]}")
+    denied_hosts: Counter[str] = Counter()
+    for line in lines:
+        try:
+            r = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(r, dict) and r.get("decision") == "deny":
+            where = r.get("host") or (f"/{r['route']}" if r.get("route") else "(no route) ") + r.get("path", "")
+            denied_hosts[where] += 1
     if denied_hosts:
         print("\nmost refused:")
         for h, n in denied_hosts.most_common(8):
@@ -2390,8 +2431,9 @@ def main(argv: list[str] | None = None) -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("init", help="mint a default cap per session and write run/tether/<session>.env")
     sub.add_parser("serve", help="run the gateway")
-    rp = sub.add_parser("report", help="spend and denials per session")
+    rp = sub.add_parser("report", help="spend and denials per session, or per (session, agent, tool)")
     rp.add_argument("--json", action="store_true")
+    rp.add_argument("--by", choices=sorted(REPORT_KEYS), default="session", help="group rows by (default session)")
     ap_audit = sub.add_parser("audit", help="check the audit log")
     ap_audit.add_argument("audit_cmd", choices=["verify"], help="verify: walk the hash chain, report the first break")
     cp = sub.add_parser("cap", help="mint, revoke and list capabilities")
@@ -2438,7 +2480,7 @@ def main(argv: list[str] | None = None) -> None:
     elif args.cmd == "audit":
         cmd_audit_verify(policy)
     else:
-        cmd_report(policy, args.json)
+        cmd_report(policy, args.json, args.by)
 
 
 if __name__ == "__main__":

@@ -6,12 +6,14 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 6 item 1 (`tether compile`) is done (run 19). **Next: milestone 6,
-item 2: `tether report --by tool`.** Group the audit by (session, agent,
-tool) with requests, denials, tokens and USD; the audit lines already carry
-`agent`/`tool`/`cap_id` (run 14/15). Unit-test it, then run it on the real
-`overnight/run/tether-msb/state/audit.jsonl`, which already has `claude git`,
-`claude npm`, `codex git` and `claude -` lines from runs 17-19.
+Milestone 6 item 2 (`tether report --by tool`) is done (run 20). **Next:
+milestone 6, item 3: Claude Code conformance** (design section 9): betas and
+`anthropic-*` headers forwarded unchanged, SSE `ping` events passed through,
+`/v1/messages/count_tokens` and `/v1/models` allowed, upstream error bodies
+forwarded unchanged, `HEAD /api/hello` answered, `skipWebFetchPreflight`
+in the compiled settings (already emitted by compile, run 19). Write a unit
+test per item against the FakeUpstream fixture first; most may already hold.
+Then one cheap haiku Claude Code run in the cage through tether to confirm.
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -880,7 +882,7 @@ Run 18 (2026-10-19) notes:
 ## 6. Compiler and conformance
 
 - [x] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
-- [ ] `tether report --by tool`
+- [x] `tether report --by tool`
 - [ ] Claude Code conformance: betas forwarded, SSE pings, `count_tokens`, error bodies, `HEAD /api/hello`, `skipWebFetchPreflight`
 
 Run 19 (2026-10-19) notes:
@@ -948,6 +950,34 @@ Run 19 (2026-10-19) notes:
 - Not done: the audit sink is fixed at `state_dir/audit.jsonl` (any other
   `file:` path gets a warning). `gateway.spend.total_usd_per_day` passes
   through unchecked against any ceiling.
+
+Run 20 (2026-10-19) notes:
+
+- New: `tether report --by tool` (`--by session` stays the default). One
+  row per (session, agent, tool): requests, denials, tokens in/out, USD
+  all-time and USD today, last seen. `--json` now prints a list of rows with
+  the key fields plus `models` and `denied_by` (deny counts per rule); nothing
+  consumed the old dict shape. The folding is `report_rows()`, testable
+  without a gateway. Lines with no agent/tool group under `-` (session caps,
+  model calls before per-agent caps). Routeless denials print as
+  `(no route) /` instead of `//`.
+- Tests: 3 new (`ReportByTool`); tether 69 + leash 14 = **83 OK**; ruff clean.
+- On the real audit (`overnight/run/tether-msb/state/audit.jsonl`):
+
+  ```
+  SESSION   AGENT   TOOL  REQS DENIED  TOKENS IN/OUT     USD
+  -         -       -       18     18          0/0  $0.0000
+  cage      -       -       38      9     29682/64  $0.0374
+  cage      claude  -       10     10          0/0  $0.0000
+  cage      claude  git     24      4          0/0  $0.0000
+  cage      claude  npm      5      0          0/0  $0.0000
+  cage      codex   git      2      0          0/0  $0.0000
+  ```
+
+  The $0.0374 model call (run 11) predates per-agent caps, so it groups
+  under `cage - -`. The demo needs a model call made with an agent cap to
+  show spend on an agent row; that comes with milestone 7/8.
+- No model calls this run.
 
 ## 7. Adversarial suite
 
