@@ -10,8 +10,8 @@ Start at milestone 0.
 
 ## 0. Setup
 
-- [ ] Read `design/poc-microsandbox-nono-leash.md` in full; note any questions here
-- [ ] Create branch `poc/msb-nono-leash` from `spike/mac-lockdown`
+- [ ] Read `design/tether-poc.md` in full; note any questions here
+- [ ] Create branch `poc/tether` from `spike/mac-lockdown`
 - [ ] `make test` passes (14 tests); `overnight/preflight.sh` passes
 - [ ] Install microsandbox (`msb`) per-user; record the version and commit
 - [ ] Install nono per-user; record the version
@@ -29,16 +29,17 @@ Start at milestone 0.
 - [ ] `nono` in the guest reports Landlock ABI V4 or later
 - [ ] GATE: if this fails, record it and switch to the nftables fallback (see PROMPT.md)
 
-## 3–4. leash++ core
+## 3–4. tether core
 
+- [ ] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
 - [ ] Channel binding: one listener per sandbox
-- [ ] Capability registry: `leash cap mint|revoke|list`, minted per boot
+- [ ] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [ ] Per-cap policy intersected with the ceiling
 - [ ] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [ ] Streamed request bodies (large `git push`)
 - [ ] `Upgrade` passthrough on routes
 - [ ] Spend reservations and a max-inflight limit; non-retryable refusal
-- [ ] Hash-chained audit with the new fields and `x-leash-request-id`
+- [ ] Hash-chained audit with the new fields and `x-tether-request-id`
 - [ ] Unit tests for each item; all tests pass
 
 ## 5. Identity in the guest
@@ -49,8 +50,8 @@ Start at milestone 0.
 
 ## 6. Compiler and conformance
 
-- [ ] `leash compile`: one policy file emits msb flags, nono profiles and leash++ config, with subset checks and wildcard lints
-- [ ] `leash report --by tool`
+- [ ] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
+- [ ] `tether report --by tool`
 - [ ] Claude Code conformance: betas forwarded, SSE pings, `count_tokens`, error bodies, `HEAD /api/hello`, `skipWebFetchPreflight`
 
 ## 7. Adversarial suite
@@ -66,12 +67,12 @@ Start at milestone 0.
 - [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
 - [ ] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
 - [ ] `overnight/REPORT.md` written
-- [ ] `git grep -n sk-ant` is clean; branch pushed; draft PR opened
+- [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
 - [ ] `DONE` written to `overnight/STATUS`
 
 ## Spend log
 
-| Run | Model calls | USD (from leash report) |
+| Run | Model calls | USD (from tether report) |
 | --- | --- | --- |
 
 ## Decisions and corrections

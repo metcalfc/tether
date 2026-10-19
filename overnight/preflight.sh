@@ -14,7 +14,7 @@ bad()  { printf '  MISS  %s\n' "$1"; fail=1; }
 warn() { printf '  warn  %s\n' "$1"; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-echo "leash overnight preflight"
+echo "tether overnight preflight"
 [[ $(uname -s)/$(uname -m) == Darwin/arm64 ]] && ok "Apple Silicon Mac" || bad "not an Apple Silicon Mac"
 [[ -f overnight/config.env ]] && ok "overnight/config.env" || bad "overnight/config.env (copy config.env.example)"
 have claude && ok "claude $(claude --version 2>/dev/null | head -1)" || bad "claude not on PATH"
@@ -30,17 +30,17 @@ if have docker && docker info >/dev/null 2>&1; then ok "docker running (for the 
 elif have limactl; then ok "lima available (for the Linux kernel build)"
 else warn "no running Docker and no Lima: the Landlock kernel build will likely fall back"; fi
 have rustup && ok "rustup" || warn "rustup missing; the run will try to install it per-user"
-security find-generic-password -s "${ANTHROPIC_KEYCHAIN:-leash-anthropic}" -w >/dev/null 2>&1 \
-  && ok "keychain: ${ANTHROPIC_KEYCHAIN:-leash-anthropic}" || bad "keychain item ${ANTHROPIC_KEYCHAIN:-leash-anthropic}"
-security find-generic-password -s "${GITHUB_KEYCHAIN:-leash-gh-scratch}" -w >/dev/null 2>&1 \
-  && ok "keychain: ${GITHUB_KEYCHAIN:-leash-gh-scratch}" || bad "keychain item ${GITHUB_KEYCHAIN:-leash-gh-scratch}"
+security find-generic-password -s "${ANTHROPIC_KEYCHAIN:-tether-anthropic}" -w >/dev/null 2>&1 \
+  && ok "keychain: ${ANTHROPIC_KEYCHAIN:-tether-anthropic}" || bad "keychain item ${ANTHROPIC_KEYCHAIN:-tether-anthropic}"
+security find-generic-password -s "${GITHUB_KEYCHAIN:-tether-gh-scratch}" -w >/dev/null 2>&1 \
+  && ok "keychain: ${GITHUB_KEYCHAIN:-tether-gh-scratch}" || bad "keychain item ${GITHUB_KEYCHAIN:-tether-gh-scratch}"
 if [[ -n ${SCRATCH_REPO:-} ]] && gh repo view "$SCRATCH_REPO" >/dev/null 2>&1; then ok "scratch repo $SCRATCH_REPO"
 else bad "scratch repo SCRATCH_REPO=${SCRATCH_REPO:-unset} not reachable"; fi
 [[ -z ${ANTHROPIC_API_KEY:-} ]] && ok "ANTHROPIC_API_KEY not exported" || warn "ANTHROPIC_API_KEY is exported here; run.sh unsets it"
 free_gb=$(df -g . | awk 'NR==2 {print $4}')
 (( free_gb >= 40 )) && ok "${free_gb} GB free" || warn "only ${free_gb} GB free; kernel build plus images want ~40 GB"
 python3 -m unittest discover -s tests >/dev/null 2>&1 && ok "leash unit tests pass" || bad "leash unit tests fail"
-[[ -f design/poc-microsandbox-nono-leash.md ]] && ok "design doc present" || bad "design/poc-microsandbox-nono-leash.md missing"
+[[ -f design/tether-poc.md ]] && ok "design doc present" || bad "design/tether-poc.md missing"
 [[ $(pmset -g 2>/dev/null | awk '$1 == "sleep" {print $2}') == 0 ]] && ok "system sleep disabled" || warn "Mac may sleep: run under caffeinate -dis (run.sh usage shows it)"
 echo
 if (( fail )); then echo "fix the MISS lines first"; exit 1; fi

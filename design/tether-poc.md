@@ -1,10 +1,12 @@
-# PoC design: microsandbox + nono + leash++
+# PoC design: microsandbox + nono + tether
 
 October 18, 2026. Design only; nothing here is implemented. Prepared for Chad Metcalf (advising Ringleader).
 
 **Pinned sources.** microsandbox `44b0a8f` (Oct 17); libkrunfw `krunfw@21f169f`, the commit microsandbox pins (branch head `70ff1e8`, Oct 16, gives the same findings); nono `cf73ec0` (Oct 16, nono-cli 0.80.0); leash `68a2b1c`.
 
-**Path prefixes.** `ms/` is microsandbox, `krunfw/` is libkrunfw, `nono/` is nono, and `leash:` refers to `/home/claude/leash/leash`, followed by a line number. Web sources are listed at the end.
+**Path prefixes.** `ms/` is microsandbox, `krunfw/` is libkrunfw, `nono/` is nono, and `leash:` refers to today's `leash` script (`./leash` in this repo), followed by a line number. Web sources are listed at the end.
+
+**Naming.** tether is the gateway this PoC builds. It starts as a copy of today's leash and grows from there, so "leash" below always means the existing script and its spike, which stay unchanged as the baseline.
 
 **Confidentiality.** Lines tagged **[RL-INTERNAL]** restate Ringleader's internal strategy doc (Sep 15) or its 8-week plan (Oct 13). Both documents are marked as containing unreleased roadmap, so strip those lines before this leaves Ringleader. Customer and prospect names from those documents are left out. **UNVERIFIED** marks anything I could not confirm from source or vendor docs.
 
@@ -22,9 +24,9 @@ October 18, 2026. Design only; nothing here is implemented. Prepared for Chad Me
 
 **Verdict: the three compose, but only after two of them are demoted.**
 
-- **microsandbox becomes a dumb L3 cage.** Its only reachable destination is one leash++ port. Its L7 features stay off: secret placeholders, TLS interception and domain rules each fight leash++, and none of them exists on a cloud VM.
+- **microsandbox becomes a dumb L3 cage.** Its only reachable destination is one tether port. Its L7 features stay off: secret placeholders, TLS interception and domain rules each fight tether, and none of them exists on a cloud VM.
 - **nono becomes an in-guest capability distributor and confiner.** It decides which process tree gets which capability and which files. Its proxy stays off, because inside the cage it adds nothing and its credential store is readable by guest root.
-- **leash++ is the only L7 authority.** It owns credentials, egress, identity, spend and audit.
+- **tether is the only L7 authority.** It owns credentials, egress, identity, spend and audit.
 
 Two seams block even the demoted composition, and both are on the critical path:
 
@@ -34,10 +36,10 @@ Two seams block even the demoted composition, and both are on the critical path:
 **Chosen architecture.**
 
 - **Cage.** Each sandbox is a microsandbox VM with network policy `deny all; allow host:tcp:<P>`: no DNS, no secrets, no interception.
-- **Gateway.** `host.microsandbox.internal:<P>` lands on leash++ on the host loopback. One port per sandbox, so the port identifies the sandbox.
-- **Guest.** Each agent runs as its own Unix user in a nono session sandbox. nono command policies give `git`, `npm` and other tools their own leash++ capability and file grants. Landlock limits every process to TCP port P.
-- **Traffic.** Credentialed and metered traffic uses explicit leash++ routes (`/anthropic/`, `/github/`). Everything else uses `HTTPS_PROXY` CONNECT to mostly-read hosts. Nothing intercepts TLS.
-- **Cloud.** The cage becomes a VPC egress rule and leash++ an appliance. Only `placement` in the policy file changes.
+- **Gateway.** `host.microsandbox.internal:<P>` lands on tether on the host loopback. One port per sandbox, so the port identifies the sandbox.
+- **Guest.** Each agent runs as its own Unix user in a nono session sandbox. nono command policies give `git`, `npm` and other tools their own tether capability and file grants. Landlock limits every process to TCP port P.
+- **Traffic.** Credentialed and metered traffic uses explicit tether routes (`/anthropic/`, `/github/`). Everything else uses `HTTPS_PROXY` CONNECT to mostly-read hosts. Nothing intercepts TLS.
+- **Cloud.** The cage becomes a VPC egress rule and tether an appliance. Only `placement` in the policy file changes.
 
 ## Architecture
 
@@ -57,19 +59,19 @@ LAPTOP -----------------------------------------------------------------------
  +--------------------------- virtio-net -------------------------------+
  msb host process: smoltcp   policy: deny * ; allow host:tcp:18001 ; no DNS
           |  gateway-IP:18001  ->  host 127.0.0.1:18001
- leash++  listener 127.0.0.1:18001  ==  sandbox chad-dev
+ tether  listener 127.0.0.1:18001  ==  sandbox chad-dev
           cap -> (sandbox, session, agent, tool, human)
           /anthropic /github routes | CONNECT allowlist | spend | audit
           keys: keychain (solo) or control plane (team) ----> api.anthropic.com
                                                               github.com, registry.npmjs.org
-CLOUD: same image, users, nono profiles. Cage = VPC egress rule {leash++:443};
-       leash++ = VPC appliance; sandbox identity = source IP instead of port.
+CLOUD: same image, users, nono profiles. Cage = VPC egress rule {tether:443};
+       tether = VPC appliance; sandbox identity = source IP instead of port.
 ```
 
 | Layer | Enforces | Forgeable by |
 |---|---|---|
-| L0 cage (microsandbox, QEMU `restrict=on`, or a cloud firewall) | The only reachable endpoint is leash++ port P | Nothing in the guest |
-| L1 gateway (leash++) | Credentials, egress, spend, audit, sandbox identity | Nothing in the guest |
+| L0 cage (microsandbox, QEMU `restrict=on`, or a cloud firewall) | The only reachable endpoint is tether port P | Nothing in the guest |
+| L1 gateway (tether) | Credentials, egress, spend, audit, sandbox identity | Nothing in the guest |
 | L2 in-guest (per-agent UIDs + nono) | Which process holds which cap; file access; TCP between processes inside the VM | Root in the guest |
 
 The design follows five rules:
@@ -85,12 +87,12 @@ The design follows five rules:
 | | Layering | Verdict |
 |---|---|---|
 | A | Cage plus a single gateway, as above | **Chosen** |
-| B | **microsandbox does L7:** a domain allowlist with DNS pinning, `$MSB_*` placeholders for GitHub; leash++ only meters `/anthropic/` | **Rejected.** Declaring any secret turns interception on (`ms/docs/cli/configuration.mdx`): a CA in the guest, and the netstack MITMs every `CONNECT` the guest opens, including to leash++ (`ms/crates/network/lib/engine/tcp/proxy.rs:328,671`). `managed.json` cannot enforce destination rules (`ms/docs/enterprise/managed-configuration.mdx`). Interception, outbound proxy and host sockets are local-only and absent on cloud VMs, so laptop and cloud would run two credential systems. Kept as the fallback for tools that ignore `HTTPS_PROXY`. |
-| C | **Chain everything:** nono phantom → nono proxy (intercepting) → upstream proxy → msb netstack (intercepting, placeholders) → leash++ | **Rejected.** Three HTTP parsers and two MITM CAs. nono's upstream hop can't carry credentials (`nono/crates/nono-proxy/src/external.rs:224`, "not yet implemented"), so leash++ loses tool identity. nono allows `http://` upstreams only on loopback (`reverse.rs:2218`). No layer owns a denial. |
+| B | **microsandbox does L7:** a domain allowlist with DNS pinning, `$MSB_*` placeholders for GitHub; tether only meters `/anthropic/` | **Rejected.** Declaring any secret turns interception on (`ms/docs/cli/configuration.mdx`): a CA in the guest, and the netstack MITMs every `CONNECT` the guest opens, including to tether (`ms/crates/network/lib/engine/tcp/proxy.rs:328,671`). `managed.json` cannot enforce destination rules (`ms/docs/enterprise/managed-configuration.mdx`). Interception, outbound proxy and host sockets are local-only and absent on cloud VMs, so laptop and cloud would run two credential systems. Kept as the fallback for tools that ignore `HTTPS_PROXY`. |
+| C | **Chain everything:** nono phantom → nono proxy (intercepting) → upstream proxy → msb netstack (intercepting, placeholders) → tether | **Rejected.** Three HTTP parsers and two MITM CAs. nono's upstream hop can't carry credentials (`nono/crates/nono-proxy/src/external.rs:224`, "not yet implemented"), so tether loses tool identity. nono allows `http://` upstreams only on loopback (`reverse.rs:2218`). No layer owns a denial. |
 | D | **Host-side `nono proxy` per sandbox as the gateway** | **Rejected for the PoC.** See the next section. |
 | E | **Ringleader's own QEMU/Lima VM** with `restrict=on` + `guestfwd` (the existing spike) | **Not rejected: the reference cage.** Same gateway, same policy. microsandbox leads on boot time, a memory-safe netstack (Rust smoltcp vs C libslirp), snapshots and fork, and Windows (WHP). QEMU leads on stock kernels (Landlock usually on, UNVERIFIED per image), full-VM behavior, and no new dependency. |
 
-**Could leash++ shrink to a compiler plus a spend/audit sidecar** once microsandbox does DNS pinning, SNI checks and placeholders? That is design B, and it cuts the wrong way: microsandbox's L7 is per-sandbox, local-only and forces interception; leash++ would still meter and audit; and two L7 policies would disagree at every edge. Cut the other way instead: keep microsandbox dumb, keep leash++ narrow, drop nono's proxy.
+**Could tether shrink to a compiler plus a spend/audit sidecar** once microsandbox does DNS pinning, SNI checks and placeholders? That is design B, and it cuts the wrong way: microsandbox's L7 is per-sandbox, local-only and forces interception; tether would still meter and audit; and two L7 policies would disagree at every edge. Cut the other way instead: keep microsandbox dumb, keep tether narrow, drop nono's proxy.
 
 ### Gateway options: extend nono's proxy, adopt an LLM gateway, or grow leash
 
@@ -114,42 +116,42 @@ Requirements:
 
 Bifrost (Go, Apache-2.0) claims virtual-key budgets and an MCP gateway (vendor claims, UNVERIFIED). LiteLLM 1.82.7 and 1.82.8 shipped to PyPI on March 24, 2026 with a credential stealer, reportedly via a compromised CI scanner; for a component holding every key, supply chain is a selection criterion.
 
-**Recommendation: grow leash 80/20 for the PoC.** Every candidate covers at most R1, R5, R6 and R8, and only for model traffic; none covers git, CONNECT egress or channel-bound identity. Adopting one still leaves leash's egress half to build, so the PoC would carry two policy engines, two audit streams and Postgres on a laptop before proving anything new. The new claims (cage, per-tool caps, per-session caps, one policy) live in the parts nobody ships. Keep the model hop swappable: the `/anthropic/` route's upstream can be LiteLLM or a Claude apps gateway instead of `api.anthropic.com`, while leash++ keeps caps, binding, egress, git and audit.
+**Recommendation: grow leash 80/20 for the PoC.** Every candidate covers at most R1, R5, R6 and R8, and only for model traffic; none covers git, CONNECT egress or channel-bound identity. Adopting one still leaves leash's egress half to build, so the PoC would carry two policy engines, two audit streams and Postgres on a laptop before proving anything new. The new claims (cage, per-tool caps, per-session caps, one policy) live in the parts nobody ships. Keep the model hop swappable: the `/anthropic/` route's upstream can be LiteLLM or a Claude apps gateway instead of `api.anthropic.com`, while tether keeps caps, binding, egress, git and audit.
 
 What flips it:
 
 - **LiteLLM for model routes:** multi-provider routing or translation becomes a requirement, or the buyer already runs it. Pin and hash-verify.
 - **Claude apps gateway for Claude Code traffic (team or cloud):** a Claude-Code-only customer with an OIDC IdP who accepts per-user instead of per-session caps. Benefit: Anthropic keeps forwarding current with new betas.
 - **Extended nono proxy:** nolabs upstreams metering, multi-session caps and streamed bodies; or Ringleader standardizes on nono's formats; or phantom-token subscription logins for solo developers outweigh per-session caps.
-- **In every case after the PoC:** rewrite leash++ in Go or Rust.
+- **In every case after the PoC:** rewrite tether in Go or Rust.
 
 ## Where each function lives
 
 | Function | Owner | Why | What the other layers do |
 |---|---|---|---|
-| Credential storage | leash++: host keychain (solo); KMS or Vault at the control plane (team, cloud) | Only component that needs plaintext keys; outside the VM | microsandbox: none. nono: caps only |
-| Credential injection | leash++ explicit routes | One injector, no MITM, same on laptop and in a VPC | msb placeholders off (they force interception). nono hands caps to tools, never keys |
-| Identity | leash++ mints `cap → (sandbox, session, agent, tool, human)`, bound to the sandbox's listener (cloud: source IP) | Sandbox identity can't be forged from the guest; a copied cap is useless off its channel | msb: per-sandbox port rule. UIDs: one per agent. nono: which process tree gets which cap |
-| Egress allowlist | leash++, per cap, intersected with the org ceiling | Outside the VM, portable, admin-owned | msb: only leash++ reachable. nono: no outbound role |
-| DNS | leash++ resolves; the guest has none | No DNS tunnels; connecting to the checked address is the pinning | msb answers every guest query NXDOMAIN (`ms/crates/network/lib/engine/dns/forwarder.rs:294`) |
+| Credential storage | tether: host keychain (solo); KMS or Vault at the control plane (team, cloud) | Only component that needs plaintext keys; outside the VM | microsandbox: none. nono: caps only |
+| Credential injection | tether explicit routes | One injector, no MITM, same on laptop and in a VPC | msb placeholders off (they force interception). nono hands caps to tools, never keys |
+| Identity | tether mints `cap → (sandbox, session, agent, tool, human)`, bound to the sandbox's listener (cloud: source IP) | Sandbox identity can't be forged from the guest; a copied cap is useless off its channel | msb: per-sandbox port rule. UIDs: one per agent. nono: which process tree gets which cap |
+| Egress allowlist | tether, per cap, intersected with the org ceiling | Outside the VM, portable, admin-owned | msb: only tether reachable. nono: no outbound role |
+| DNS | tether resolves; the guest has none | No DNS tunnels; connecting to the checked address is the pinning | msb answers every guest query NXDOMAIN (`ms/crates/network/lib/engine/dns/forwarder.rs:294`) |
 | In-VM process-to-process | nono (Landlock TCP port rule, file grants) + per-agent UIDs (permissions on Unix sockets) | Only an in-guest layer can tell processes apart | — |
-| TLS interception | Nowhere | No CA in the guest, no broken pinning, no msb CONNECT MITM | leash++ reads SNI from the ClientHello on tunnels |
-| Spend metering and caps | leash++ | It is the TLS client to the provider, so it alone sees usage frames | nono per-route rate limits: optional brake |
-| Audit (system of record) | leash++: hash-chained JSONL, exported | Outside the guest; one record for all layers | nono: per-session ledger shipped at session end (supplementary; guest-root forgeable). msb: runtime logs, OTel byte counters |
-| Policy authoring | One file, `leash compile` | Proves inner rules ⊆ outer rules | msb and nono configs are build artifacts |
-| Lifecycle | leash++ mints caps per boot and revokes; msb creates, stops, snapshots | Revocation must not depend on the guest | nono: one session per agent run |
-| Human approvals | leash++ queue (new hosts, routes, cap raises); nono approvals post to it (approval-webhook-v1) | One queue; egress decisions outside the guest | — |
+| TLS interception | Nowhere | No CA in the guest, no broken pinning, no msb CONNECT MITM | tether reads SNI from the ClientHello on tunnels |
+| Spend metering and caps | tether | It is the TLS client to the provider, so it alone sees usage frames | nono per-route rate limits: optional brake |
+| Audit (system of record) | tether: hash-chained JSONL, exported | Outside the guest; one record for all layers | nono: per-session ledger shipped at session end (supplementary; guest-root forgeable). msb: runtime logs, OTel byte counters |
+| Policy authoring | One file, `tether compile` | Proves inner rules ⊆ outer rules | msb and nono configs are build artifacts |
+| Lifecycle | tether mints caps per boot and revokes; msb creates, stops, snapshots | Revocation must not depend on the guest | nono: one session per agent run |
+| Human approvals | tether queue (new hosts, routes, cap raises); nono approvals post to it (approval-webhook-v1) | One queue; egress decisions outside the guest | — |
 
 Threat model:
 
 | Threat | Stopped by | Not stopped by (residual risk) |
 |---|---|---|
-| Prompt-injected agent | leash++ allowlist and routes; channel-bound caps; no DNS in the guest; nono file grants | Exfiltration through allowed channels: the prompt itself, a push to an allowed org repo, query strings sent to allowed download hosts |
-| Agent smuggles in an attacker's own provider key | leash++ refuses CONNECT to any host that has a route (`leash:429`), and routes strip guest credentials. Without that, the provider becomes a dead drop | — |
+| Prompt-injected agent | tether allowlist and routes; channel-bound caps; no DNS in the guest; nono file grants | Exfiltration through allowed channels: the prompt itself, a push to an allowed org repo, query strings sent to allowed download hosts |
+| Agent smuggles in an attacker's own provider key | tether refuses CONNECT to any host that has a route (`leash:429`), and routes strip guest credentials. Without that, the provider becomes a dead drop | — |
 | Malicious dependency (postinstall script) | npm's cap allows only the registry. nono file grants block `~/.ssh`, other caps and `.git/`. Landlock blocks reading other domains' `/proc/*/environ` (verify) | Files written into the project that a later tool runs (git ignores hooks). Data hidden in registry GET paths |
 | Compromised tool or MCP server | Its own cap and its own file grants | Anything inside those grants |
-| Root in the guest (kernel bug, the human's `sudo`, misconfiguration) | The microsandbox cage; leash++ ceilings and caps; no real keys in the guest | Can use every cap in the guest within its scope, forge tool identity, and rewrite nono's ledger |
-| Curious developer | Team mode: keys never reach the laptop | Solo mode: leash++ runs as them, and the keychain is theirs |
+| Root in the guest (kernel bug, the human's `sudo`, misconfiguration) | The microsandbox cage; tether ceilings and caps; no real keys in the guest | Can use every cap in the guest within its scope, forge tool identity, and rewrite nono's ledger |
+| Curious developer | Team mode: keys never reach the laptop | Solo mode: tether runs as them, and the keychain is theirs |
 | Malicious developer | Team mode: the org ceiling, plus audit at the control plane. Cloud: the VPC egress rule | On a laptop they own the machine and can run agents outside Ringleader. Every laptop product concedes this |
 | Stolen laptop | OS disk encryption; revoking caps and the device | Code and snapshots on disk; solo-mode keys |
 | Compromised host | Team mode limits damage to the cap and the time until revocation | Everything local |
@@ -158,7 +160,7 @@ Threat model:
 
 ### microsandbox: the cage
 
-**Role.** Hardware isolation plus one L3 invariant: the only reachable endpoint is leash++ port P.
+**Role.** Hardware isolation plus one L3 invariant: the only reachable endpoint is tether port P.
 
 **Must do:**
 
@@ -167,15 +169,15 @@ Threat model:
   - agentd writes the gateway alias into `/etc/hosts` (`ms/crates/agentd/lib/network.rs:23`), so the guest needs no DNS.
 - **Add no DNS rule.** Denied queries get a synthetic NXDOMAIN immediately, with no resolver timeouts.
 - **Run workloads as non-root** (`--user dev`). Agents run under their own UIDs inside nono.
-- **Keep caps in a tmpfs** (`--tmpfs /run/leash`), written at boot over the host-driven control channel.
+- **Keep caps in a tmpfs** (`--tmpfs /run/tether`), written at boot over the host-driven control channel.
 - **Boot the custom libkrunfw.**
 
 **Must not:**
 
 - **Use secrets or placeholders.** They would be a second injector, and they turn interception on.
 - **Intercept TLS.** With interception state present, the netstack treats any guest flow that starts with `CONNECT` as a tunnel to MITM (`tcp/proxy.rs:328`).
-- **Use domain rules.** They subject every plain-HTTP request to per-authority policy checks (`proxy.rs:367`, `secrets/handler.rs:593`), including requests to leash++.
-- **Use the outbound proxy for leash++.** It sends `CONNECT <ip>:<port>` with no authentication (`ms/crates/network/lib/proxy/http_connect.rs:63`), so leash++ would lose both the hostname and the identity. One later exception: a proxy enforced through `managed.json` is the only network floor an admin can pin on a device.
+- **Use domain rules.** They subject every plain-HTTP request to per-authority policy checks (`proxy.rs:367`, `secrets/handler.rs:593`), including requests to tether.
+- **Use the outbound proxy for tether.** It sends `CONNECT <ip>:<port>` with no authentication (`ms/crates/network/lib/proxy/http_connect.rs:63`), so tether would lose both the hostname and the identity. One later exception: a proxy enforced through `managed.json` is the only network floor an admin can pin on a device.
 - **Publish ports beyond `127.0.0.1`,** or connect vsock to powerful host sockets.
 
 **Seams and how they are resolved:**
@@ -192,7 +194,7 @@ Threat model:
 6. **Docker in the VM works** on a flat root disk (`ms/docs/how-to/docker/docker-in-sandbox.mdx`), but `docker.sock` is guest root: give it to a `docker` tool with its own proxy settings and cap, never to an agent.
 7. **Full snapshots capture memory, caps included.** Caps are minted per boot and bound to the sandbox, so a restored clone gets a new identity and new caps.
 8. **Developer ergonomics.** The rootfs is OCI, not devcontainer: run `devcontainer build` and pin the image digest. Keep the workspace on guest disk (virtio-fs is slow for installs) and sync through the git route. IDE attach uses `msb ssh serve --stdio` as a ProxyCommand, with no inbound port; the VS Code server needs its own tool cap or a pre-built image.
-9. **Do not forward ssh-agent.** Landlock through ABI V6 (kernel 6.12) cannot govern `connect()` on pathname Unix sockets (`nono/neps/0004-opt-in-linux-namespace-isolation.md`). Use git through the leash++ route.
+9. **Do not forward ssh-agent.** Landlock through ABI V6 (kernel 6.12) cannot govern `connect()` on pathname Unix sockets (`nono/neps/0004-opt-in-linux-namespace-isolation.md`). Use git through the tether route.
 
 ### nono: capabilities inside the guest
 
@@ -209,7 +211,7 @@ Threat model:
   - The real job is inside the VM: an npm script cannot reach another agent's dev server or a database in the VM.
   - Landlock port rules match any destination host (`nono/docs/cli/features/networking.mdx`), but inside the cage that imprecision does not matter.
 - **Harden tool launches.** Give git `argv_prepend: ["-c","core.hooksPath=/dev/null"]`, pin executables, and deny direct-exec bypass for any tool that holds a cap.
-- **Optionally,** send approvals and session audit to leash++ through nono's open protocols (`nono/docs/protocols/approval-webhook-v1.md`, `audit-delivery-v1.md`).
+- **Optionally,** send approvals and session audit to tether through nono's open protocols (`nono/docs/protocols/approval-webhook-v1.md`, `audit-delivery-v1.md`).
 
 **Must not:**
 
@@ -223,35 +225,35 @@ Threat model:
 2. **Putting a cap inside `HTTPS_PROXY`'s userinfo.** Whether env promotion supports templated values is UNVERIFIED. Fallback: grant the cap file to a single tool with `fs_read_file` and use a three-line launcher.
 3. **Tools run under the agent's UID.** Keeping a tool's cap secret from the agent depends on Landlock's ptrace and `/proc` scoping. The PoC must test this.
 4. **Interpreter bypass** (`node .../npm-cli.js`) runs with the agent's authority, not npm's. It cannot get npm's cap, so it fails closed.
-5. **Fallback for per-agent identity without nono.** Map each UID to its own leash++ port with in-guest nftables (`meta skuid`; `CONFIG_NF_TABLES=y` is set in libkrunfw). This needs no Landlock. Per-tool identity still needs nono.
+5. **Fallback for per-agent identity without nono.** Map each UID to its own tether port with in-guest nftables (`meta skuid`; `CONFIG_NF_TABLES=y` is set in libkrunfw). This needs no Landlock. Per-tool identity still needs nono.
 
-### leash++: the gateway
+### tether: the gateway
 
 **Role.** The only component that sees plaintext or credentials.
 
 **Lifecycle.**
 
-- **Create:** `leash compile`, then leash++ picks port P and mints caps, then `msb create` builds the cage, then `msb exec` writes the caps to `/run/leash` and starts the nono sessions.
-- **Revoke:** `leash cap revoke` takes effect immediately and does not depend on the guest.
+- **Create:** `tether compile`, then tether picks port P and mints caps, then `msb create` builds the cage, then `msb exec` writes the caps to `/run/tether` and starts the nono sessions.
+- **Revoke:** `tether cap revoke` takes effect immediately and does not depend on the guest.
 
 **Must not** intercept tunnels, run inside a VM, store headers or bodies, act as a plain-HTTP forward proxy, or trust client-asserted identity (`x-claude-code-session-id` and `x-claude-code-agent-id` are recorded, not trusted).
 
 **Changes from today's leash:**
 
 1. **Channel binding.** One listener per sandbox on `127.0.0.1`. In the cloud, one TLS listener that binds by source IP, with optional mTLS. A cap works only on its own sandbox's channel. Today leash has a single listener.
-2. **Cap registry.** Each cap maps to `{sandbox, session, agent, tool, human, routes, egress, spend sub-cap, expiry}`. Commands: `leash cap mint|revoke|list`. Caps are minted at each boot and delivered into tmpfs. Today leash reads a static `sessions` list.
+2. **Cap registry.** Each cap maps to `{sandbox, session, agent, tool, human, routes, egress, spend sub-cap, expiry}`. Commands: `tether cap mint|revoke|list`. Caps are minted at each boot and delivered into tmpfs. Today leash reads a static `sessions` list.
 3. **Per-cap policy,** intersected with the org ceiling.
 4. **CONNECT hardening.** Resolve on the host; refuse loopback, RFC 1918, link-local, metadata, CGNAT and ULA addresses unless allowlisted by address; connect to the checked address; require ClientHello SNI to equal the CONNECT host; refuse IP literals. Today leash checks the name, then calls `socket.create_connection((host, port))` (`leash:524`). A gateway on the host sits on the host's loopback, LAN and VPN, so that call is a pivot the guest alone would not have. Encrypted ClientHello fails closed; Host-header fronting inside TLS remains possible on CDNs that permit it.
 5. **Stream request bodies.** Today `_read_body` buffers up to 64 MiB (`leash:678`), so a large `git push` fails.
 6. **Pass `Upgrade` through on routes,** for Codex and MCP over WebSocket.
 7. **Spend reservations.** Reserve at admission (input bytes ÷ 4 × input price + `max_tokens` × output price) and reconcile at stream end. Cap concurrent calls per session. Bill aborted streams at a floor of about 4 characters per token, as the Claude apps gateway does. Refuse with a non-retryable error. Today leash checks before and charges after, so overshoot equals the calls in flight.
-8. **Audit.** Add `sandbox`, `agent`, `tool`, `human`, `cap_id`, `request_id`, `upstream_request_id`, `policy_version` and `rule`, plus the client-sent Claude Code IDs. Chain lines with `prev_hash`, ship signed checkpoints over OTLP or HTTPS, and return `x-leash-request-id` so guest logs can join.
+8. **Audit.** Add `sandbox`, `agent`, `tool`, `human`, `cap_id`, `request_id`, `upstream_request_id`, `policy_version` and `rule`, plus the client-sent Claude Code IDs. Chain lines with `prev_hash`, ship signed checkpoints over OTLP or HTTPS, and return `x-tether-request-id` so guest logs can join.
 9. **Claude Code conformance.** Answer `HEAD /api/hello` (sent only when no proxy is set). Allow `/v1/messages/count_tokens` and `/v1/models`. Forward `anthropic-*` headers, bodies and error bodies unchanged. Set `skipWebFetchPreflight: true`: the preflight calls `api.anthropic.com` directly, and CONNECT to a route host must stay refused. The fast-mode check also goes direct and will report an error; accepted.
 10. **Stretch: ref-scoped pushes.** Read the leading pkt-lines of `git-receive-pack` and allow only `refs/heads/agent/*`.
-11. **`leash compile`.** Emits microsandbox flags, nono profiles and leash++ config. It checks that inner rules are subsets of outer rules and lints wildcards.
+11. **`tether compile`.** Emits microsandbox flags, nono profiles and tether config. It checks that inner rules are subsets of outer rules and lints wildcards.
 12. **Team mode (not in the PoC).** Model routes forward to Ringleader's hosted metering endpoint [RL-INTERNAL: built, not deployed] or to a Claude apps gateway.
 
-**Unchanged:** no interception, no DNS service, no headers or bodies in logs, and capability strings rather than credentials in the guest. Clients speak HTTP/1.1 to leash++; one that insists on HTTP/2 to the gateway is out of scope.
+**Unchanged:** no interception, no DNS service, no headers or bodies in logs, and capability strings rather than credentials in the guest. Clients speak HTTP/1.1 to tether; one that insists on HTTP/2 to the gateway is out of scope.
 
 ## Request walkthroughs
 
@@ -260,7 +262,7 @@ Threat model:
 1. `claude` (uid `agent-claude`) sends `POST http://host.microsandbox.internal:18001/anthropic/v1/messages?beta=true` with `Authorization: Bearer lsh_C…`. `NO_PROXY` covers the gateway alias, so there is no CONNECT.
 2. In the guest, Landlock permits TCP port 18001, and `/etc/hosts` resolves the alias to the gateway IP.
 3. The microsandbox netstack matches the `host` group on TCP 18001, allows the connection and dials `127.0.0.1:18001` on the host. Nothing parses the bytes.
-4. leash++ checks and forwards the request:
+4. tether checks and forwards the request:
    1. Port 18001 identifies `chad-dev`, and cap C resolves to `(s1, claude, tool=-)`.
    2. It confirms C is bound to `chad-dev` and the path is `/v1/messages`; the query string is ignored.
    3. It reserves an estimate against the session, agent and team caps.
@@ -268,7 +270,7 @@ Threat model:
 5. SSE is relayed chunk by chunk, pings included. The meter reads `message_start` and `message_delta`, then settles the reservation when the stream ends.
 6. One audit line records the decision, rule, model, tokens, cost in USD, latency, upstream request ID and `prev_hash`.
 
-Only leash++ and microsandbox's host process see plaintext on the laptop hop, and both are on the trusted side. In the cloud, that hop is TLS.
+Only tether and microsandbox's host process see plaintext on the laptop hop, and both are on the trusted side. In the cloud, that hop is TLS.
 
 **2. `git push`**
 
@@ -277,7 +279,7 @@ Only leash++ and microsandbox's host process see plaintext on the laptop hop, an
    - cap G, which only `cmd.git` can redeem;
    - `GIT_CONFIG_*` that rewrites `https://github.com/` to `http://git:G@…:18001/github/`;
    - hooks disabled.
-2. On `GET …/info/refs?service=git-receive-pack`, leash++ resolves G to `tool=git`, matches the path glob `/acme/*/info/refs`, and injects the fine-grained token as Basic auth.
+2. On `GET …/info/refs?service=git-receive-pack`, tether resolves G to `tool=git`, matches the path glob `/acme/*/info/refs`, and injects the fine-grained token as Basic auth.
 3. `POST …/git-receive-pack` streams the packfile (change 5). The audit line records `tool=git` and `bytes_up`.
 4. Denials:
    - a push to `/evil/x` gets a 403 on the path;
@@ -287,7 +289,7 @@ Only leash++ and microsandbox's host process see plaintext on the laptop hop, an
 **3. `npm install`**
 
 1. npm runs in its command sandbox with write access to `/work` and `~/.npm`, no access to `/work/.git`, and `HTTPS_PROXY=http://npm:N@…:18001`.
-2. npm sends `CONNECT registry.npmjs.org:443` with `Proxy-Authorization`. leash++:
+2. npm sends `CONNECT registry.npmjs.org:443` with `Proxy-Authorization`. tether:
    1. resolves N to `tool=npm`;
    2. checks the host against npm's allowlist;
    3. resolves the name on the host and confirms a public address;
@@ -311,8 +313,8 @@ Only leash++ and microsandbox's host process see plaintext on the laptop hop, an
 **5. A malicious postinstall script running as another tool**
 
 1. It runs as a child of npm, in npm's command sandbox with cap N.
-2. Reading `~dev/.ssh`, `/run/leash/*` or `/proc/<claude>/environ` is blocked by file permissions and Landlock.
-3. `curl https://webhook.site` gets a 403 from leash++, logged as `tool=npm`, because npm may only reach the registry.
+2. Reading `~dev/.ssh`, `/run/tether/*` or `/proc/<claude>/environ` is blocked by file permissions and Landlock.
+3. `curl https://webhook.site` gets a 403 from tether, logged as `tool=npm`, because npm may only reach the registry.
 4. Writing `.git/hooks/pre-push` is refused, and git ignores hooks anyway.
 5. It cannot call a model, because N carries no route.
 6. If it gets root, the cage still holds. The damage is capped by the caps in the guest and the session's spend cap.
@@ -359,9 +361,9 @@ placement: laptop                            # or {cloud: gcp, project: …, net
 
 How each section compiles:
 
-| Section | microsandbox | nono | leash++ |
+| Section | microsandbox | nono | tether |
 |---|---|---|---|
-| `machine` | `msb create <image@digest> --name chad-dev --cpus 4 -m 8G --user dev --net-default deny --net-rule "allow@host:tcp:18001" --tmpfs /run/leash` (network flags verified; others illustrative) | Users and home directories created at bootstrap | Listener `127.0.0.1:18001`, bound to `chad-dev` |
+| `machine` | `msb create <image@digest> --name chad-dev --cpus 4 -m 8G --user dev --net-default deny --net-rule "allow@host:tcp:18001" --tmpfs /run/tether` (network flags verified; others illustrative) | Users and home directories created at bootstrap | Listener `127.0.0.1:18001`, bound to `chad-dev` |
 | `agents.<a>` | — | Session profile: file grants, `tcp_connect_ports: [18001]`, environment (`ANTHROPIC_BASE_URL`, `HTTPS_PROXY`, `NO_PROXY`), Claude settings | One cap per (session, agent), carrying its routes, egress and spend |
 | `…tools.<t>` | — | Command policy: file grants, cap delivery, `argv_prepend`, pinned executable | One cap per (session, agent, tool) |
 | `gateway`, `ceiling`, `audit` | — | Audit target (optional) | Routes, injection, key sources, ceiling, sink |
@@ -375,10 +377,10 @@ The compiler refuses a policy that breaks any of these rules:
 
 **Laptop to cloud: only `placement` changes.**
 
-- **The cage** becomes a VPC egress rule that allows only leash++ on port 443, with no public IP.
+- **The cage** becomes a VPC egress rule that allows only tether on port 443, with no public IP.
   - Close DNS with the provider's DNS firewall (AWS Route 53 Resolver DNS Firewall; GCP and Azure equivalents UNVERIFIED). Otherwise the VM can resolve names through the VPC resolver.
   - Attach no instance identity: no service account, and IMDS turned off. Otherwise root in the guest gets cloud credentials.
-- **leash++** runs the same binary and config as an appliance:
+- **tether** runs the same binary and config as an appliance:
   - a TLS listener with a name-constrained CA;
   - sandboxes identified by source IP;
   - keys from KMS or Vault;
@@ -430,7 +432,7 @@ The rest of the brief also holds:
 
 **Adopt, build, partner:**
 
-- **Build:** leash++, the compiler, audit and the capability registry. They are the control point and the differentiation.
+- **Build:** tether, the compiler, audit and the capability registry. They are the control point and the differentiation.
 - **Adopt behind a driver interface:** microsandbox, but only if it beats QEMU and WSL2 on boot time and on Windows. QEMU `restrict=on` stays the reference cage.
 - **Interoperate:** nono, as an optional layer inside the guest. Implement receivers for nono's audit-delivery-v1 and approval-webhook-v1, so Ringleader can serve as the control plane for nono users without depending on nolabs' cloud.
 - **Optional:** use the Claude apps gateway for the model hop in team mode.
@@ -470,7 +472,7 @@ The rest of the brief also holds:
 
 **Scope.**
 
-- **In:** one Apple Silicon Mac and one Linux host; the microsandbox cage on a custom libkrunfw; leash++ in solo mode with keys in the host keychain; Claude Code on an API key; git smart-HTTP to one GitHub org; npm and PyPI over CONNECT; per-agent UIDs; nono session and git/npm command policies; `leash compile`; JSONL audit and `leash report`.
+- **In:** one Apple Silicon Mac and one Linux host; the microsandbox cage on a custom libkrunfw; tether in solo mode with keys in the host keychain; Claude Code on an API key; git smart-HTTP to one GitHub org; npm and PyPI over CONNECT; per-agent UIDs; nono session and git/npm command policies; `tether compile`; JSONL audit and `tether report`.
 - **Stretch:** Codex on an API key; one cloud VM; the gateway bake-off.
 - **Out:** Windows; team mode and the control plane; SIEM export beyond a file; devcontainer translation (use a pre-built OCI image); Docker in the VM; IDE attach; MCP servers; ChatGPT-login Codex; any TLS interception; an approvals UI (CLI only); the production rewrite.
 
@@ -480,28 +482,28 @@ The rest of the brief also holds:
 |---|---|---|
 | 1 | **Cage.** Run today's leash on the host and an msb sandbox with `deny` plus `allow@host:tcp:P`. Port `attack.sh` and `works.sh`, run Claude Code end to end, and record boot time and time to first byte | Every BLOCK line holds |
 | 2 | **Kernel.** Build libkrunfw with Landlock and confirm `nono run` sees ABI V6 in the guest | If it does not, switch to the nftables fallback |
-| 3–4 | **leash++ core:** binding, cap registry, CONNECT hardening, streamed bodies, `Upgrade`, reservations, the hash chain | |
+| 3–4 | **tether core:** binding, cap registry, CONNECT hardening, streamed bodies, `Upgrade`, reservations, the hash chain | |
 | 5 | **Identity in the guest:** UIDs, nono session and command profiles, cap delivery | |
-| 6 | **Compiler:** `leash compile`, `leash report --by tool`, and Claude Code conformance checks (betas, pings, `count_tokens`, error bodies, `HEAD /api/hello`) | |
+| 6 | **Compiler:** `tether compile`, `tether report --by tool`, and Claude Code conformance checks (betas, pings, `count_tokens`, error bodies, `HEAD /api/hello`) | |
 | 7 | **Adversarial suite:** an injected README, a malicious npm fixture, root in the guest, replaying a cap from another sandbox, and four concurrent streams against the cap | |
 | 8 | **Record the demo** and fill in `RESULTS.md` | |
-| 9 (stretch) | **Cloud:** the same file on one cloud VM with an egress rule and a leash++ VM | |
+| 9 (stretch) | **Cloud:** the same file on one cloud VM with an egress rule and a tether VM | |
 | 10 (stretch) | **Gateway bake-off:** put LiteLLM and the Claude apps gateway behind `/anthropic/`, rerun the conformance and cap tests, and record whether anything flips the recommendation | |
 
 **Demo script (about 6 minutes):**
 
-1. Show the policy file, then `leash compile` and its three outputs.
+1. Show the policy file, then `tether compile` and its three outputs.
 2. Run `msb create` and time the boot.
 3. In the guest, `env` shows only caps, and `grep` finds no `sk-ant` keys.
 4. Claude fixes a failing test: it runs `npm install`, then `git push` to `acme/app`.
-5. `leash report` shows one line per (agent, tool), with spend.
+5. `tether report` shows one line per (agent, tool), with spend.
 6. A README injection tries a paste site and a push to `evil/x`. Both are refused and attributed.
 7. A malicious package's postinstall script is denied the files, the network and the agent's cap, and logged as `tool=npm`.
 8. Gain root with `sudo`, kill nono and flush nftables, then try DNS, a raw IP and host ports. Everything is blocked. A cap replayed from a second sandbox gets a 403.
 9. Four prompts run in parallel. The cap trips, and the report shows the overshoot.
-10. `leash cap revoke`, and the next call fails.
+10. `tether cap revoke`, and the next call fails.
 
-**Measurements:** boot to agent-ready; time to first byte (p50, p95) through leash++ vs direct, and added SSE inter-chunk delay; CONNECT setup time; `npm install` on guest disk vs virtio-fs; 200 MB `git push` throughput; overshoot with reservations on and off; msb process and guest memory; nono launch cost per command.
+**Measurements:** boot to agent-ready; time to first byte (p50, p95) through tether vs direct, and added SSE inter-chunk delay; CONNECT setup time; `npm install` on guest disk vs virtio-fs; 200 MB `git push` throughput; overshoot with reservations on and off; msb process and guest memory; nono launch cost per command.
 
 **Success criteria:**
 
@@ -510,7 +512,7 @@ The rest of the brief also holds:
 - Every credentialed call is attributed to a (session, agent, tool).
 - A cap replayed from another sandbox fails.
 - With 4 concurrent streams, overshoot stays within one reservation.
-- leash++ adds no more than 5 ms to time to first byte at p50, and no stream aborts during a 30-minute session.
+- tether adds no more than 5 ms to time to first byte at p50, and no stream aborts during a 30-minute session.
 - One file produces the configuration for all three layers.
 
 **Kill criteria:**
@@ -518,7 +520,7 @@ The rest of the brief also holds:
 - No Landlock kernel by day 2: drop nono and the per-tool claims.
 - A real escape from the cage: stop using microsandbox and continue on QEMU.
 - Claude Code needs its requests rewritten, not just forwarded: move the model hop to the Claude apps gateway.
-- More than 50 ms added at p50, or stalled streams: rewrite leash++ before the demo.
+- More than 50 ms added at p50, or stalled streams: rewrite tether before the demo.
 
 ### Sources
 
