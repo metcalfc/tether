@@ -6,21 +6,37 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3–4 is done (all 10 items). **Start milestone 5 (identity in the
-guest), item 1: per-agent Unix users and a shared `/work`.** Re-read the
-design first: "nono: capabilities inside the guest" (items 1-5), the
-"Policy model" section, and the plan row for milestone 5. Then, in the cage
-(`spike/msb/cage.sh`, Landlock kernel via `MSB_LIBKRUNFW_PATH`, tether as
-the gateway as in run 11): create one Unix user per agent (e.g. `claude`,
-`codex`) and a group `work`; `/work` owned by `root:work`, mode 2775
-(setgid), with default ACLs (`setfacl -d -m g:work:rwX`). First check
-whether `setfacl` exists in `node:22-bookworm`. If it doesn't, the guest
-can't `apt install acl` unless deb.debian.org is on the egress allowlist:
-either allow it for the setup step or fall back to setgid plus `umask 002`,
-and record which. Verify: each user can create files in `/work` that the
-other can edit; neither can read the other's home; root-owned `/run/tether`
-is not readable by them. Script it in `cage.sh` (e.g. `cage.sh users`) and
-record what you ran.
+Milestone 5 item 1 is done (run 16). **Next: milestone 5, item 2: a nono
+session profile per agent, command policies for git and npm, and cap
+delivery via tmpfs.** Re-read the design's "nono: capabilities inside the
+guest" (Must do, and seams 2-4) and the Policy model's `agents.claude.tools`.
+Boot the cage as in run 16 (env block below), run `cage.sh users`, then:
+mint caps per (agent) and per (agent, tool) with `tether cap mint`, write
+each into `/run/tether/<agent>/<tool>` as root (owner = that agent's UID,
+mode 0400, dir 0700), and work out how nono hands a cap to one tool only.
+First read nono 0.80.0's own docs/help in the guest (`/opt/nono/nono --help`,
+`nono run --help`, profile schema) to see whether the token broker /
+`GrantSet` / command policies (`cmd.<name>`) exist in this release and
+whether env promotion supports a templated value such as
+`HTTPS_PROXY=http://cap:{{token}}@host...`. If not, take the design's
+fallback: grant the cap file to one tool with `fs_read_file` and a
+three-line launcher. Session profile per agent: fs write `/work` + its home,
+`tcp_connect_ports: [18001]`. git: `argv_prepend -c core.hooksPath=/dev/null`,
+plus the `.git` finding from run 16 below. Script it as `cage.sh nono` (or
+extend `users`), and record what you ran and nono's per-command launch cost.
+
+Cage env used in runs 11 and 16 (tether as the gateway, Landlock kernel):
+
+```sh
+export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib \
+  CAGE_GW=$PWD/tether CAGE_POLICY=$PWD/overnight/run/tether-msb/policy.json
+spike/msb/cage.sh gw-up && spike/msb/cage.sh up && spike/msb/cage.sh users
+# ... and always: spike/msb/cage.sh down
+```
+
+`overnight/run/tether-msb/policy.json` is gitignored; it is
+`spike/msb/policy.json` with `state_dir` pointing at
+`overnight/run/tether-msb/state`. If it is missing, recreate it that way.
 
 ## 0. Setup
 
@@ -672,9 +688,58 @@ Run 15 (2026-10-19) notes:
 
 ## 5. Identity in the guest
 
-- [ ] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
+- [x] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
 - [ ] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
 - [ ] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
+
+Run 16 (2026-10-19) notes:
+
+- New: `spike/msb/guest/users.sh` (`setup`, `check`; pushed to
+  `/opt/leash/` like the other guest scripts) and `cage.sh users` (runs both
+  as guest root). Cage: tether as gateway, Landlock kernel, env block in
+  "Next step".
+- **Users:** group `work` (gid 2000); agents `claude` (2001) and `codex`
+  (2002), each with its own group, in `work`, home mode 0700; the human `dev`
+  (1500) is in `work` too, with no sudo (the image has none).
+- **`/work`:** `root:work`, mode 2775 (setgid), access and default ACL
+  `user::rwx,group::rwx,group:work:rwx,mask::rwx,other::r-x`.
+- **Decision: no `setfacl`.** `node:22-bookworm` ships `libacl1` but not
+  the `acl` package, and installing it would need deb.debian.org on the
+  egress allowlist (and apt switched to https, since tether is not a
+  plain-HTTP proxy). Instead `users.sh` writes the
+  `system.posix_acl_access`/`_default` xattrs directly from python3
+  (version 2 header plus (tag, perm, id) entries) and reads them back to
+  print them. The kernel has `CONFIG_FS_POSIX_ACL`, `EXT4_FS_POSIX_ACL` and
+  `TMPFS_POSIX_ACL`, and the overlay root honours them. So it is a real
+  default ACL, not the setgid + `umask 002` fallback.
+- **`/run/tether`:** the msb `--tmpfs` mount, set to `root:root 0700`.
+- **`cage.sh users` check: 18/18 PASS**, with every agent write under
+  `umask 022`:
+  - Sharing: claude creates `/work/.../f`; codex appends to it, creates a
+    file in claude's directory; claude edits and renames codex's file; dev
+    edits claude's file; new files get group `work` and mode `rw-rw-r--`;
+    new directories inherit setgid.
+  - Separation: neither agent can read or list the other's home, codex can't
+    write into claude's home, and neither can list, read or write
+    `/run/tether`.
+  - **Control:** in a setgid-only dir (`/work-noacl`, no ACL) under the same
+    umask, codex **cannot** append to claude's file. So the ACL, not
+    setgid, is what makes sharing work.
+- **Finding (git across agent UIDs):** in `/work/repo` created by claude,
+  codex's `git status` fails with `fatal: detected dubious ownership`
+  (git 2.39.5). And because of the shared ACL, codex **can write claude's
+  `.git/`** (`touch .git/x` succeeded). That is a cross-agent code-execution
+  path: whatever one agent writes into `.git/config` (`core.fsmonitor`,
+  `core.pager`, filter/diff drivers, aliases) or `.git/hooks` runs as the
+  other agent the next time it runs git. `core.hooksPath=/dev/null` alone
+  does not cover the config keys. **Decision:** do not set
+  `safe.directory=*` (it would switch off git's own guard against exactly
+  this). Handle it in item 2: nono grants `.git/` writes only to the git
+  command policy of the agent that owns the repo; other agents and tools get
+  `/work` with `/work/**/.git` denied, as the design already does for npm.
+  Reading `.git` across agents remains possible (git still refuses on
+  ownership).
+- Boot to first exec: 0.40 s. No model calls this run.
 
 ## 6. Compiler and conformance
 
@@ -716,3 +781,7 @@ Run 15 (2026-10-19) notes:
   `containers/libkrunfw`; build the kernel on the container's own filesystem
   because the macOS volume is case-insensitive. The Day-2 gate passed with
   Landlock ABI V6, so nono stays in the plan.
+- Run 16: default ACLs on `/work` are written as raw `system.posix_acl_*`
+  xattrs (no `setfacl` in the image, no deb.debian.org egress). Shared
+  `/work` lets one agent write another's `.git/`, so `.git` writes must be
+  limited to the owning agent's git (item 2); `safe.directory=*` is not used.

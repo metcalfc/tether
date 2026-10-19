@@ -17,6 +17,8 @@
 #   cage.sh attack     run guest/attack.sh as root, with a live control
 #                      listener on host port CAGE_PORT+1 and the host LAN IP
 #   cage.sh works      run guest/works.sh
+#   cage.sh users      per-agent users and a shared /work (guest/users.sh
+#                      setup), then prove it (users.sh check)
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -162,6 +164,11 @@ cmd_works() {
     "set -a; . $GUEST_ENV; set +a; export ANTHROPIC_MODEL=${CAGE_MODEL:-claude-haiku-4-5}; $GUEST_DIR/works.sh"
 }
 
+cmd_users() {
+  limit 120 "$MSB" exec "$NAME" --no-stdin -- "$GUEST_DIR/users.sh" setup
+  limit 120 "$MSB" exec "$NAME" --no-stdin -- "$GUEST_DIR/users.sh" check
+}
+
 cmd_down() {
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
@@ -177,7 +184,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  gw-up | gw-down | up | check | push | attack | works | down | status) "cmd_${1//-/_}" ;;
+  gw-up | gw-down | up | check | push | attack | works | users | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,25p' "$0"; exit 2 ;;
+  *) sed -n '2,27p' "$0"; exit 2 ;;
 esac
