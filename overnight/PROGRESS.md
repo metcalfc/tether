@@ -6,24 +6,15 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 2, first item: build libkrunfw with Landlock and load it with
-`MSB_LIBKRUNFW_PATH`. Plan:
-- Find the libkrunfw version msb 0.7.8 ships (`~/.microsandbox/lib/libkrunfw.5.dylib`,
-  kernel 6.12.111 per `uname -r` in the guest; check `strings` for a
-  version, or the microsandbox repo's pinned libkrunfw tag). Clone that tag
-  of `containers/libkrunfw` into `overnight/run/libkrunfw/` (gitignored).
-- Add `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and
-  `CONFIG_LSM="landlock,..."` to its kernel config (`config-libkrunfw_aarch64`).
-- macOS build: libkrunfw's README builds the kernel in a Linux container.
-  Docker 29.9.1 is available (`/usr/local/bin/docker`) and so is
-  `limactl`. Build the kernel in an arm64 Linux container, then produce the
-  dylib on the host (`make` on macOS links the generated `kernel.c`). Put
-  every long step under `perl -e 'alarm shift; exec @ARGV' N`, run it in the
-  background with a log under `overnight/run/`.
-- Test: `MSB_LIBKRUNFW_PATH=<dylib> msb run --mount-dir ~/.microsandbox/tether-guest/bin:/opt/nono:ro debian:bookworm-slim -- /opt/nono/nono setup --check-only`
-  should report a Landlock ABI (want V4+), and `cat /sys/kernel/security/lsm`
-  should list landlock.
-- Gate: about two runs of real effort, then take the nftables fallback.
+Milestone 3, first item: copy `./leash` to `./tether` and
+`tests/test_leash.py` to `tests/test_tether.py`, rename inside them (CLI
+name, state dir, `x-tether-request-id`, log prefix), add a `make` target for
+the tether tests, and confirm both suites pass (14 leash tests unchanged).
+Re-read the tether section of `design/tether-poc.md` first (new milestone).
+From now on, boot the cage with the Landlock kernel:
+`export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
+(rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
+if `overnight/run/` was wiped; ~11 min).
 
 ## 0. Setup
 
@@ -209,9 +200,60 @@ Run 5 (2026-10-18) notes:
 
 ## 2. Kernel (design day 2, gate)
 
-- [ ] Build libkrunfw with `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and landlock in `CONFIG_LSM`; load with `MSB_LIBKRUNFW_PATH`
-- [ ] `nono` in the guest reports Landlock ABI V4 or later
-- [ ] GATE: if this fails, record it and switch to the nftables fallback (see PROMPT.md)
+- [x] Build libkrunfw with `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and landlock in `CONFIG_LSM`; load with `MSB_LIBKRUNFW_PATH`
+- [x] `nono` in the guest reports Landlock ABI V4 or later
+- [x] GATE: if this fails, record it and switch to the nftables fallback (see PROMPT.md) -- **gate passed, no fallback**
+
+Run 6 (2026-10-18) notes:
+
+- **Source:** microsandbox's fork is `github.com/superradcompany/libkrunfw`
+  (the `zerocore-ai` and `microsandbox` org URLs redirect to it), not
+  `containers/libkrunfw`. Commit `21f169f` ("reject stale kernel bundles")
+  exists there: `FULL_VERSION = 5.6.1`, `linux-6.12.111`, matching the
+  shipped dylib's `Linux version 6.12.111 (root@libkrunfw) ... Fri Jul 24
+  13:01:52 WAT 2026` banner. Upstream containers/libkrunfw v5.6.2 is still on
+  6.12.109 and lacks microsandbox's patches (0031-0035), so the fork matters.
+  Cloned into `overnight/run/libkrunfw` (gitignored).
+- **New:** `spike/msb/kernel/landlock.config` (the fragment: `SECURITY`,
+  `SECURITYFS`, `SECURITY_NETWORK`, `SECURITY_PATH`, `SECURITY_LANDLOCK`,
+  `LSM="landlock"`; no Yama/AppArmor/SELinux), `build.sh` (patches the
+  aarch64 config, builds `kernel.c` in a `fedora:latest` arm64 Docker
+  container, links the dylib on the host with the fork's Makefile),
+  `check.sh` + `guest-check.sh` (boot a throwaway sandbox on a given dylib
+  and probe Landlock).
+- **Decision:** build inside the container's own filesystem (rsync `/src` to
+  `/build`), not on the bind mount as the fork's `build_in_docker.sh` does:
+  the kernel tree has case-only filename clashes (e.g. netfilter
+  `xt_TCPMSS.c`/`xt_tcpmss.c`) that a default case-insensitive APFS volume
+  can't hold, and virtiofs is slow for a kernel build. Only `kernel.c` and the
+  final `.config` come back.
+- **Build:** one attempt, exit 0, **~11 min** wall (dnf builddep ~5 min,
+  kernel ~6 min on 10 vCPUs). The resulting `.config` has `CONFIG_SECURITY=y`,
+  `CONFIG_SECURITY_LANDLOCK=y`, `CONFIG_LSM="landlock"`. Dylib 24.2 MB,
+  ad-hoc linker-signed, sha256 `c9d1d272...0742`. ld warns about reducing the
+  `__DATA` alignment from 64K to 16K; the guest boots fine.
+- **Check (stock dylib, negative control):** no `/sys/kernel/security/lsm`,
+  `landlock_create_ruleset` returns ENOSYS, `nono setup --check-only` fails
+  with "No supported Landlock ABI detected".
+- **Check (`MSB_LIBKRUNFW_PATH=.../krunfw-landlock/libkrunfw.5.dylib`):**
+  `lsm: capability,landlock`; `landlock_create_ruleset(..., VERSION)` returns
+  **6**; `nono setup --check-only` says **Landlock V6** with TCP network
+  filtering, "Installation verified". The Landlock TCP rule holds: with a
+  python listener on guest 127.0.0.1:8080, unsandboxed connect is ok, under
+  `nono run --allow-connect-port 18001` it gets **EACCES** (immediate), and
+  under `--allow-connect-port 8080` it connects. msb loads the ad-hoc dylib
+  with no prompt (the `disable-library-validation` entitlement is on msb, as
+  the design says).
+- **Cage regression on the new kernel:** `cage.sh gw-up && up && attack`
+  with `MSB_LIBKRUNFW_PATH` exported: "all held: the only way out is the
+  gateway" (boot to first exec 0.26 s). The kernel change doesn't touch the
+  cage: enforcement is in the host msb process.
+- **Note for milestone 5:** inside an msb sandbox, agentd does not mount
+  securityfs, so `/sys/kernel/security/lsm` is absent unless you
+  `mount -t securityfs securityfs /sys/kernel/security`. nono doesn't need it
+  (it probes with the syscall).
+- nono needs `--allow-cwd` (or a profile) in non-interactive `nono run`.
+- No model calls this run.
 
 ## 3–4. tether core
 
@@ -262,3 +304,9 @@ Run 5 (2026-10-18) notes:
 | 5 | 44 via leash + 22 direct (haiku, bench) | $0.0057 via leash; direct est. < $0.005 |
 
 ## Decisions and corrections
+
+- Run 6: the design's libkrunfw is microsandbox's fork
+  (`superradcompany/libkrunfw` @ `21f169f`, 5.6.1, kernel 6.12.111), not
+  `containers/libkrunfw`; build the kernel on the container's own filesystem
+  because the macOS volume is case-insensitive. The Day-2 gate passed with
+  Landlock ABI V6, so nono stays in the plan.
