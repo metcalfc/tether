@@ -112,6 +112,8 @@ CLIENT_ID_HEADERS = {
 }
 UPSTREAM_ID_HEADERS = ("request-id", "x-request-id", "x-github-request-id")
 ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
+# Paths on a metered route that cost nothing upstream.
+FREE_SUFFIXES = ("/count_tokens",)
 # An aborted stream with no usage is billed at about 4 characters per token.
 CHARS_PER_TOKEN = 4
 
@@ -1107,6 +1109,13 @@ class Gateway:
         )
 
 
+def billable(route: Route, method: str, path: str) -> bool:
+    """Only a POST that makes a model call is reserved and metered: listing
+    models and counting tokens are free, so they hold no reservation and no
+    inflight slot."""
+    return route.meter and method == "POST" and not path.endswith(FREE_SUFFIXES)
+
+
 def presented_tokens(headers: dict[str, str]) -> list[str]:
     out: list[str] = []
     for k in CRED_HEADERS:
@@ -1418,6 +1427,14 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 self._audit(decision="deny", rule="route:none", reason="no such route", **rec)
                 self._error(404, "not_found_error", f"no route /{name}/")
                 return
+            if route.inject == "anthropic" and rest == "/api/hello" and self.command in ("HEAD", "GET"):
+                # Claude Code's reachability probe: no credential, nothing to
+                # forward. Answered here so it needs neither a cap nor a path.
+                self._audit(decision="allow", status=200, rule=f"route:{name}:hello", **rec)
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             if not route.allowed(rest):
                 why = "path is not on the route's allowlist"
                 self._audit(decision="deny", rule=f"route:{name}:path", reason=why, **rec)
@@ -1461,7 +1478,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 self._error(400, "invalid_request_error", str(e))
                 return
             res = None
-            if route.meter:
+            if billable(route, self.command, rest):
                 est = reserve_usd(gw.p.prices, body.data)
                 res, blocked, spend_rule = gw.admit(cap, est)
                 if blocked:

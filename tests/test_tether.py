@@ -38,6 +38,12 @@ loader.exec_module(tether)
 
 REAL_KEY = "sk-ant-api03-REAL-SECRET"
 GH_TOKEN = "ghp_REAL_TOKEN"
+SSE_PING = b"event: ping\ndata: {\"type\": \"ping\"}\n\n"
+ERROR_BODY = {
+    "type": "error",
+    "error": {"type": "overloaded_error", "message": "Overloaded"},
+    "request_id": "req_upstream_err",
+}
 
 
 class FakeUpstream(http.server.BaseHTTPRequestHandler):
@@ -53,6 +59,24 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(n) or b"{}")
         FakeUpstream.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+        if body.get("fail"):
+            out = json.dumps(ERROR_BODY).encode()
+            self.send_response(body["fail"])
+            self.send_header("Content-Type", "application/json")
+            self.send_header("retry-after", "7")
+            self.send_header("anthropic-ratelimit-tokens-remaining", "0")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        if self.path.split("?")[0].endswith("/count_tokens"):
+            out = json.dumps({"input_tokens": 42}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         if body.get("stream"):
             events = [
                 {
@@ -66,7 +90,7 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
                 {"type": "message_delta", "usage": {"output_tokens": 500}},
                 {"type": "message_stop"},
             ]
-            out = b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
+            out = SSE_PING + b"".join(b"event: x\ndata: " + json.dumps(e).encode() + b"\n\n" for e in events)
             ctype = "text/event-stream"
         else:
             out = json.dumps(
@@ -83,6 +107,14 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         FakeUpstream.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
+        if self.path.startswith("/v1/models"):
+            out = json.dumps({"data": [{"id": "claude-haiku-4-5", "type": "model"}], "has_more": False}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         out = b"001e# service=git-upload-pack\n0000"
         self.send_response(200)
         self.send_header("x-github-request-id", "C0FF:EE:1234")
@@ -300,7 +332,7 @@ class TetherTest(unittest.TestCase):
                     "upstream": up,
                     "credential": "env:T_ANTHROPIC",
                     "inject": "anthropic",
-                    "paths": ["/v1/messages"],
+                    "paths": ["/v1/messages", "/v1/messages/count_tokens", "/v1/models", "/v1/models/*"],
                     "meter": True,
                 },
                 "github": {
@@ -424,6 +456,102 @@ class TetherTest(unittest.TestCase):
         self.assertEqual(st, 200)
         # and the cap survives a restart
         self.assertGreaterEqual(tether.Ledger(self.policy.state_dir / "spend.json").totals("alice")[0], 3.0)
+
+    # --- Claude Code conformance (design section 9)
+
+    def request(self, method: str, path: str, headers: dict[str, str]) -> tuple[http.client.HTTPResponse, bytes]:
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request(method, path, headers=headers)
+        r = c.getresponse()
+        out = r.read()
+        c.close()
+        return r, out
+
+    def test_anthropic_headers_and_beta_query_forwarded_verbatim(self) -> None:
+        h = {
+            "x-api-key": self.caps["alice"],
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "claude-code-20250219,interleaved-thinking-2025-05-14,context-1m-2025-08-07",
+            "anthropic-dangerous-direct-browser-access": "true",
+            "x-stainless-retry-count": "0",
+            "user-agent": "claude-cli/2.1.303 (external, cli)",
+        }
+        st, _ = self.post("/anthropic/v1/messages?beta=true", {"stream": True}, h)
+        self.assertEqual(st, 200)
+        seen = FakeUpstream.seen[-1]
+        self.assertEqual(seen["path"], "/v1/messages?beta=true")
+        for k, v in h.items():
+            if k != "x-api-key":
+                self.assertEqual(seen["headers"][k], v, k)
+        self.assertEqual(seen["headers"]["x-api-key"], REAL_KEY)
+
+    def test_sse_relayed_byte_for_byte_pings_included(self) -> None:
+        h = {"Authorization": "Bearer " + self.caps["alice"]}
+        st, out = self.post("/anthropic/v1/messages", {"stream": True}, h)
+        self.assertEqual(st, 200)
+        self.assertTrue(out.startswith(SSE_PING), out[:80])
+        self.assertIn(b'"message_stop"', out)
+        # metered as before: the ping is skipped, not miscounted
+        rec = [r for r in self.audit() if r.get("kind") == "api"][-1]
+        self.assertEqual(rec["tokens"], {"in": 1000, "cr": 10000, "out": 500})
+
+    def test_count_tokens_and_models_allowed_and_free(self) -> None:
+        h = {"Authorization": "Bearer " + self.caps["alice"]}
+        st, out = self.post("/anthropic/v1/messages/count_tokens", {"model": "claude-opus-4-1", "messages": []}, h)
+        self.assertEqual((st, json.loads(out)), (200, {"input_tokens": 42}))
+        r, out = self.request("GET", "/anthropic/v1/models?limit=1000", h)
+        self.assertEqual(r.status, 200)
+        self.assertEqual(json.loads(out)["data"][0]["id"], "claude-haiku-4-5")
+        r, _ = self.request("GET", "/anthropic/v1/models/claude-haiku-4-5", h)
+        self.assertEqual(r.status, 200)
+        recs = [x for x in self.audit() if x.get("kind") == "api"]
+        self.assertEqual(len(recs), 3)
+        for rec in recs:
+            self.assertNotIn("reserve_usd", rec)
+            self.assertIsNone(rec.get("usd"))
+        self.assertEqual(self.gw.ledger.totals("alice")[0], 0)
+        # a spent cap still refuses model calls, but not the free calls
+        self.post("/anthropic/v1/messages", {}, h)  # $3.00, over the $1 cap
+        st, _ = self.post("/anthropic/v1/messages", {}, h)
+        self.assertEqual(st, 403)
+        st, _ = self.post("/anthropic/v1/messages/count_tokens", {"messages": []}, h)
+        self.assertEqual(st, 200)
+
+    def test_upstream_error_bodies_and_headers_forwarded_unchanged(self) -> None:
+        h = {"Authorization": "Bearer " + self.caps["alice"]}
+        for code in (400, 429, 500, 529):
+            c = http.client.HTTPConnection("127.0.0.1", self.port)
+            c.request("POST", "/anthropic/v1/messages", json.dumps({"fail": code}), h)
+            r = c.getresponse()
+            out = r.read()
+            c.close()
+            self.assertEqual(r.status, code)
+            self.assertEqual(json.loads(out), ERROR_BODY)
+            self.assertEqual(r.getheader("retry-after"), "7")
+            self.assertEqual(r.getheader("anthropic-ratelimit-tokens-remaining"), "0")
+            self.assertEqual(r.getheader("request-id"), None)
+        statuses = [x["status"] for x in self.audit() if x.get("kind") == "api"]
+        self.assertEqual(statuses, [400, 429, 500, 529])
+        self.assertEqual(self.gw.ledger.totals("alice")[0], 0)
+
+    def test_api_hello_answered_without_upstream_or_capability(self) -> None:
+        for method in ("HEAD", "GET"):
+            r, out = self.request(method, "/anthropic/api/hello", {"User-Agent": "claude-cli/2.1.303"})
+            self.assertEqual((r.status, out), (200, b""))
+            self.assertTrue(r.getheader("x-tether-request-id"))
+        self.assertEqual(FakeUpstream.seen, [])
+        self.assertEqual([x["rule"] for x in self.audit()], ["route:anthropic:hello"] * 2)
+        # only on the model route, and only the probe
+        r, _ = self.request("HEAD", "/github/api/hello", {})
+        self.assertEqual(r.status, 403)
+        r, _ = self.request("POST", "/anthropic/api/hello", {"Content-Length": "0"})
+        self.assertEqual(r.status, 403)
+
+    def test_compiled_settings_skip_the_webfetch_preflight(self) -> None:
+        out, lints = tether.compile_policy(HERE / "spike/msb/poc-policy.json")
+        self.assertEqual(lints.errors, [])
+        for agent, settings in out["settings"].items():
+            self.assertIs(settings.get("skipWebFetchPreflight"), True, agent)
 
     # --- egress
 

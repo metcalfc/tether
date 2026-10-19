@@ -560,3 +560,7 @@ Found while building the PoC (Oct 18–19, 2026). The code wins; details are in 
   - "Each tool's grants fit inside its agent's" holds for files only. The design's own example gives `git` the `github` route while `claude` has only `anthropic`, so a tool's routes and egress are checked against the ceiling, not against its agent. That is the point of per-tool caps: the agent's own cap cannot push.
   - Unknown keys are errors, so a typo cannot quietly widen or drop a grant.
   - msb gets no `--user dev`: the bootstrap (users, ACLs, caps) runs as guest root over `msb exec`, and agents run under their own UIDs through `setpriv` and nono.
+- **Claude Code conformance (milestone 6).**
+  - `/api/hello` is not a route path. Claude Code 2.1.303 sends `HEAD ${ANTHROPIC_BASE_URL}/api/hello` with no credential, so tether answers it itself (200, empty body, audited as `route:anthropic:hello`) on routes that inject an Anthropic key. It needs no cap and never reaches the upstream. In the cage it is not sent at all, because the proxy variables are set.
+  - Only a `POST` on a metered route is reserved and metered. `count_tokens` and `GET /v1/models` cost nothing upstream, so they hold no reservation and no inflight slot, and they still answer once a cap is spent. They still need a cap that is granted the route.
+  - Claude Code rejects an empty `~/.claude.json` as corrupt and makes no request. The guest setup writes `{}`.

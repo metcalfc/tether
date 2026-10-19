@@ -61,7 +61,12 @@ cmd_setup() {
   local a d
   for a in $AGENTS; do
     for d in .claude .cache .npm; do install -d -m 0700 -o "$a" -g "$a" "/home/$a/$d"; done
-    [[ -f /home/$a/.claude.json ]] || install -m 0600 -o "$a" -g "$a" /dev/null "/home/$a/.claude.json"
+    # Claude Code rejects an empty .claude.json as corrupt; {} is the smallest valid one.
+    if [[ ! -s /home/$a/.claude.json ]]; then
+      echo '{}' >"/home/$a/.claude.json"
+      chown "$a:$a" "/home/$a/.claude.json"
+      chmod 0600 "/home/$a/.claude.json"
+    fi
     install -d -m 0750 -o root -g "$a" "/run/tether/$a"
     [[ -f $COMPILED/nono/$a.json ]] || { log "no $COMPILED/nono/$a.json: run tether compile, then cage.sh push"; exit 1; }
     install -m 0644 "$COMPILED/nono/$a.json" "$PROFILES/$a.json"
