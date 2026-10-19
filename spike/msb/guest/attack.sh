@@ -23,6 +23,9 @@ GW_PORT=${GW_PORT%%/*}
 CONTROL_PORT=${CONTROL_PORT:-18002}
 HOST_LAN=${HOST_LAN:-}
 RESOLVER=$(awk '$1 == "nameserver" {print $2; exit}' /etc/resolv.conf)
+# A real key's shape (as in PROMPT.md's pre-push grep). Only the shape: nono's
+# binary, and its shims in /tmp, carry the template string sk-ant-oat01-{}.
+export KEY_RE='sk-ant-(api|oat)[0-9]{2}-[A-Za-z0-9_-]{40,}|gho_[A-Za-z0-9]{36}'
 fails=0
 row() { printf '  %-6s %-5s %s\n' "$1" "$2" "$3"; }
 
@@ -127,8 +130,9 @@ expect block "cloud metadata (169.254.169.254:80)"                 tcp 169.254.1
 expect block "via the gateway: example.com (not allowlisted)"      curl -sS -f -m 8 https://example.com
 expect block "via the gateway: tunnel to api.anthropic.com"        curl -sS -f -m 8 https://api.anthropic.com/v1/models
 expect block "via the gateway, but without the capability"         env -u HTTPS_PROXY -u https_proxy curl -sS -f -m 8 -x "$GW" https://pypi.org/simple/
-expect block "a real key anywhere in env, home, /etc, /opt or /tmp" \
-  bash -c 'env | grep -qE "sk-ant-(api|oat)|gho_" || grep -rqsE "sk-ant-(api|oat)[0-9]{2}-|gho_[A-Za-z0-9]{20}" /home /root /etc /opt /tmp /var/tmp /run'
+# shellcheck disable=SC2016 # KEY_RE is expanded by the inner bash
+expect block "a real key in any environ, home, /etc, /opt, /tmp or /run" \
+  bash -c 'grep -rqsE "$KEY_RE" /proc/[0-9]*/environ /home /root /etc /opt /tmp /var/tmp /run'
 expect allow "the gateway answers at $GW"                           bash -c "[ \"\$(curl -s -o /dev/null -m 5 -w '%{http_code}' $GW/)\" != 000 ]"
 expect allow "the gateway answers by IP ($GW_IP:$GW_PORT)"          tcp "$GW_IP" "$GW_PORT"
 expect allow "via the gateway: pypi.org (allowlisted)"             bash -c "[ \"\$(curl -s -o /dev/null -m 15 -w '%{http_code}' https://pypi.org/simple/)\" = 200 ]"

@@ -32,7 +32,8 @@
 #   cage.sh adv CASE   milestone 7's adversarial cases (guest/adv.sh CASE as
 #                      guest root), then check tether's audit lines from
 #                      this run (advcheck.py); run `users` and `nono` first.
-#                      CASE: readme, pkg
+#                      CASE: readme, pkg, root (root also starts the
+#                      control listener, as attack does)
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -187,23 +188,33 @@ cmd_check() {
 
 cmd_push() { push_files "$(state_dir)/$SESSION.env"; }
 
-cmd_attack() {
-  local ctl=$((PORT + 1)) lan pid rc=0
-  lan=$(ipconfig getifaddr en0 2>/dev/null || true)
-  # A real listener on the next port, on loopback and the LAN, so "blocked"
-  # cannot mean "nothing was listening".
-  python3 -m http.server "$ctl" --bind 0.0.0.0 >"$RUN/cage-control.log" 2>&1 &
+# A real listener on CAGE_PORT+1, on loopback and the LAN, so "blocked"
+# cannot mean "nothing was listening". Sets CTL_PORT and HOST_LAN.
+control_up() {
+  local pid
+  CTL_PORT=$((PORT + 1))
+  HOST_LAN=$(ipconfig getifaddr en0 2>/dev/null || true)
+  python3 -m http.server "$CTL_PORT" --bind 0.0.0.0 >"$RUN/cage-control.log" 2>&1 &
   pid=$!
   echo "$pid" >"$RUN/cage-control.pid"
   sleep 0.5
-  if [[ $(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$ctl/") != 200 ]]; then
-    kill "$pid" 2>/dev/null || true; die "control listener on $ctl did not come up"
+  if [[ $(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$CTL_PORT/") != 200 ]]; then
+    control_down; die "control listener on $CTL_PORT did not come up"
   fi
-  log "control listener on 0.0.0.0:$ctl answers 200 from the host; host LAN ${lan:-unknown}"
-  limit 300 "$MSB" exec "$NAME" --no-stdin -- bash -lc \
-    "set -a; . $GUEST_ENV; set +a; export LEASH_GW=http://host.microsandbox.internal:$PORT CONTROL_PORT=$ctl HOST_LAN=$lan; $GUEST_DIR/attack.sh" || rc=$?
-  kill "$pid" 2>/dev/null || true
+  log "control listener on 0.0.0.0:$CTL_PORT answers 200 from the host; host LAN ${HOST_LAN:-unknown}"
+}
+
+control_down() {
+  [[ -f $RUN/cage-control.pid ]] && kill "$(cat "$RUN/cage-control.pid")" 2>/dev/null || true
   rm -f "$RUN/cage-control.pid"
+}
+
+cmd_attack() {
+  local rc=0
+  control_up
+  limit 300 "$MSB" exec "$NAME" --no-stdin -- bash -lc \
+    "set -a; . $GUEST_ENV; set +a; export LEASH_GW=http://host.microsandbox.internal:$PORT CONTROL_PORT=$CTL_PORT HOST_LAN=$HOST_LAN; $GUEST_DIR/attack.sh" || rc=$?
+  control_down
   return "$rc"
 }
 
@@ -255,11 +266,16 @@ cmd_adv() {
   local audit from rc=0
   audit="$(state_dir)/audit.jsonl"
   from=$(wc -l <"$audit" | tr -d ' ')
+  CTL_PORT='' HOST_LAN=''
+  [[ $1 != root ]] || control_up
   limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" \
-    CAGE_MODEL="${CAGE_MODEL:-claude-haiku-4-5}" ADV_MODEL_RUN="${ADV_MODEL_RUN:-1}" "$GUEST_DIR/adv.sh" "$1" || rc=$?
+    CONTROL_PORT="$CTL_PORT" HOST_LAN="$HOST_LAN" \
+    CAGE_MODEL="${CAGE_MODEL:-claude-haiku-4-5}" ADV_MODEL_RUN="${ADV_MODEL_RUN:-1}" "$GUEST_DIR/adv.sh" "$1" |
+    sed 's/tth_[A-Za-z0-9_-]*/tth_REDACTED/g' || rc=$?
+  [[ $1 != root ]] || control_down
   [[ $rc == 0 ]] || log "adv.sh $1 exited $rc"
   sleep 1 # tether writes a CONNECT's line when the tunnel closes
-  python3 "$HERE/advcheck.py" "$audit" "$from" "$1"
+  python3 "$HERE/advcheck.py" "$audit" "$from" "$1" "$POLICY"
 }
 
 cmd_down() {
@@ -280,5 +296,5 @@ case "${1:-}" in
   compile | gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
   adv) shift; cmd_adv "$@" ;;
-  *) sed -n '2,46p' "$0"; exit 2 ;;
+  *) sed -n '2,48p' "$0"; exit 2 ;;
 esac

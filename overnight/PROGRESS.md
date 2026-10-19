@@ -6,28 +6,20 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 7 item 2 (malicious npm package) is done (run 23). **Next: milestone 7,
-item 3: root in the guest**, design walkthrough and demo step 8: "gain root,
-kill nono and flush nftables, then try DNS, a raw IP and host ports".
-Most of it exists: `cage.sh attack` already runs `guest/attack.sh` as guest
-root (24/24 in run 3, on the old leash cage). Re-run it on the compiled
-tether cage *after* `users` + `nono` (so nono sessions are live), and add to
-it, as a new `adv.sh root` case or in attack.sh:
-- kill every nono supervisor (`kill -9` by pid from `/proc/*/comm`, not
-  `pkill -f`); show agent processes now run without Landlock;
-- "flush nftables": the image has no nft; say so, and note that enforcement
-  is in the host msb process, so there is nothing in the guest to flush;
-- as root, with every cap in `/run/tether` readable: DNS (UDP/TCP 53 to
-  the guest resolver and 1.1.1.1), raw IPs (1.1.1.1:443, 140.82.112.3:443),
-  host ports (host LAN IP and gateway IP on 22, CAGE_PORT+1 with the
-  control listener up, as `cage.sh attack` does), IPv6;
-- what root *can* do: use every cap in the guest within its grant (e.g. the
-  claude git cap clones the scratch repo; the npm cap still cannot reach
-  webhook.site). advcheck `root`: no allow line to anything outside the
-  ceiling, and the cap uses attributed to their (agent, tool).
-No model calls are needed. Then item 4 (cap replayed from a second sandbox:
-boot a second msb sandbox on another port/listener, replay claude's cap
-there, expect `cap:channel` style 403) and item 5 (four concurrent streams).
+Milestone 7 item 3 (root in the guest) is done (run 24). **Next: milestone 7,
+item 4: a cap replayed from a second sandbox gets a 403.** Plan: boot a second
+msb sandbox (another name, its own listener port, e.g. 18011, and a second
+`sandboxes` entry in the tether policy, so tether binds one listener per
+sandbox), copy claude's agent cap out of the first cage's `/run/tether/claude/agent`
+as root (cap value redacted in logs), and use it from the second sandbox
+against its own listener: model route (`GET /anthropic/v1/models`, free) and
+a CONNECT to pypi.org. Expect a 403 with a `cap:channel`-style rule and the
+audit line naming the second sandbox. Control: the same request from the
+first cage gets 200. Add `advcheck.py replay`. Check how `tether compile`
+emits sandboxes first (`overnight/run/compiled/tether.json` has only
+`tether-cage`), and whether the channel check is already unit-tested
+(item "Channel binding" in milestones 3-4). Then item 5 (four concurrent
+streams against the cap; record the overshoot, with and without reservations).
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -1045,7 +1037,7 @@ Run 21 (2026-10-19) notes:
 
 - [x] Injected README (paste site, push to another org)
 - [x] Malicious npm package fixture (postinstall)
-- [ ] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
+- [x] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
 - [ ] Capability replayed from a second sandbox gets a 403
 - [ ] Four concurrent streams against the cap; record the overshoot
 
@@ -1136,6 +1128,61 @@ Run 23 (2026-10-19) notes:
 - Tests: tether 77 + leash 14 = 91 OK; ruff, shellcheck and `/bin/bash -n`
   clean. Logs: `overnight/run/run23-{boot,adv,nono}.log`.
 
+Run 24 (2026-10-19) notes:
+
+- New: `adv.sh root` + `advcheck.py root` (`cage.sh adv root`). `cage.sh`
+  now shares the host control listener (`control_up`/`control_down`, a
+  real `http.server` on CAGE_PORT+1 that answers 200 from the host) between
+  `attack` and `adv root`. advcheck takes the compiled `tether.json` as a 4th
+  argument and reads the ceiling (egress allowlist, route paths) from it.
+  Boot as in run 23: compiled output, Landlock kernel, `users` 0 failed,
+  `nono` 0 failed. No model calls.
+- **Killing nono.** Root `kill -9`s every process whose comm is `nono`. In
+  this design that is only the session supervisor of a live claude session.
+  The session's children **keep running and keep their Landlock domain**:
+  before and after the kill, the world-readable decoy is `denied` and
+  `connect(1.1.1.1:443)` is `EACCES` (Landlock is irrevocable; the
+  supervisor does not hold it). **Mediated tools fail closed:** after the
+  kill, git in that session fails with `command-mediation shim failed to
+  connect to .../supervisor.sock: Connection refused`, rc 126. npm does the
+  same, and the tool cap file stays unreadable. Control: a new session has
+  its own supervisor, and its git works (rc 0). What root *does* get is the
+  obvious part: a process started as claude without the launcher has no
+  Landlock and reads the decoy and claude's cap files (Unix perms still keep
+  claude out of codex's). Root itself reads every cap.
+- **"Flush nftables":** the image has no nft, iptables or ip. attack.sh tries
+  them anyway and says so. Enforcement is in the host msb process, so there
+  is nothing in the guest to flush. "Gain root with `sudo`" (design demo step
+  8) is also moot: `msb exec` is root, and the image has no sudo.
+- **attack.sh as root, after the kill: 24/24 PASS.** All blocked: DNS (UDP and
+  TCP, to 1.1.1.1 and to the guest resolver 172.16.0.5), raw HTTPS to
+  1.1.1.1, example.com and api.anthropic.com, IPv6, ICMP, UDP to the gateway,
+  host ssh, the live control port by name, by gateway IP and on the host
+  LAN IP (192.168.10.31), the gateway port on the LAN IP, and 169.254.169.254.
+  Allowed: the gateway, and pypi through it with a cap.
+- **Fixed a false positive in attack.sh's "real key anywhere" probe.** It
+  failed on the compiled cage because nono's binary (and its shim copies in
+  `/tmp/nono-tool-sandbox-*`) embeds the template `sk-ant-oat01-{}`. The probe
+  now uses the real-key shape from PROMPT.md's pre-push grep (40+ key
+  characters, `gho_` + 36) and also scans every `/proc/*/environ`. Positive
+  control on the host: a fake 45-character key and a fake `gho_` token both
+  match, while the template and the regex itself do not.
+- **Root spends every cap** (all 6 are `root:<agent> 0440`), and each buys its
+  grant and nothing else:
+  - claude git cap: clone of the scratch repo OK; `evil/x` 403;
+  - codex git cap: `anthropics/claude-code` 403;
+  - claude npm cap: registry 200, webhook.site CONNECT 403;
+  - claude agent cap: `GET /anthropic/v1/models` 200, example.com 403;
+  - codex agent cap (`TETHER_CAPABILITY`; codex's env has no
+    `ANTHROPIC_AUTH_TOKEN`): models 403 (`cap:route-grant`), example.com 403.
+  Every use is audited under the cap's (agent, tool), e.g. root's clone shows
+  as `tether-cage claude git`. That is the design's "forge tool identity"
+  (threat table): it holds, and it stays within the ceiling.
+- **advcheck root: 10/10 PASS.** No allow line names a host or route path
+  outside the compiled ceiling, and no model call was billed.
+- Tests: 91 OK (tether 77 + leash 14, no tether change). ruff, shellcheck
+  and `/bin/bash -n` are clean. Logs: `overnight/run/run24-{boot,nono,adv}.log`.
+
 ## 8. Demo and write-up
 
 - [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
@@ -1180,3 +1227,7 @@ Run 23 (2026-10-19) notes:
   opt-in `scripts: true` gives `sh` npm's files, but no cap, no network and
   no `npm_config_*` (npm exports its cap-bearing proxy URL there). `.git/hooks`
   stays writable by npm; hooks are ignored by mediated git instead.
+- Run 24: killing the nono supervisor leaves the session's Landlock domain
+  in place, and its mediated tools fail closed (rc 126). Nothing in the guest
+  holds the network policy. attack.sh's key probe now matches a real key's
+  shape only, because nono's binary embeds `sk-ant-oat01-{}`.
