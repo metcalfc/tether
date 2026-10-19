@@ -136,9 +136,9 @@ step_8() {
   title "8. root in the guest kills nono, then tries every way out"
   "$CAGE" adv root >"$LOGS/step-8.log" 2>&1 || true
   grep -E 'kill -9|nono left|t=(1|8) |BLOCK|failures|evil/x|another repo|webhook|example.com|advcheck|[0-9]+/[0-9]+ PASS|FAIL' \
-    "$LOGS/step-8.log" | grep -vE '^ *PASS +(ALLOW|BLOCK)' | cut -c1-150 | head -24
-  printf '  attack.sh: %s blocked, %s failed\n' "$(grep -cE 'PASS +BLOCK' "$LOGS/step-8.log" || true)" \
-    "$(grep -cE '^ *FAIL' "$LOGS/step-8.log" || true)"
+    "$LOGS/step-8.log" | grep -vE '^ *PASS +(allow|block)' | cut -c1-150 | head -24
+  printf '  attack.sh: %s blocked, %s failed\n' "$(grep -cE '^ *PASS +block' "$LOGS/step-8.log" || true)" \
+    "$(grep -cE '^ *FAIL +(allow|block)' "$LOGS/step-8.log" || true)"
   title "8b. a cap copied to a second sandbox"
   "$CAGE" replay >"$LOGS/step-8b.log" 2>&1 || true
   grep -E '^== |^(models|connect|git|own|port) |PASS|FAIL' "$LOGS/step-8b.log" | grep -v '^  PASS' | cut -c1-150
@@ -149,7 +149,7 @@ step_9() {
   title "9. four streams at once against a spend cap"
   show "spike/msb/overshoot.sh (a host tether; four streaming haiku calls per scenario, reservations on, then off)"
   "$HERE/overshoot.sh" >"$LOGS/step-9.log" 2>&1 || true
-  grep -vE '^\s*$' "$LOGS/step-9.log" | tail -14 | cut -c1-150
+  grep -E '^===|four:|^reserve=' "$LOGS/step-9.log" | sed -E 's/ \(max reserve_usd.*//'
 }
 
 step_10() {

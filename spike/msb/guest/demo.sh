@@ -11,7 +11,7 @@
 #   demo.sh call     one model call from claude's session (GET /v1/models)
 #
 # Environment: SCRATCH_REPO (metcalfc/tether-scratch), DEMO_MODEL (empty:
-# Claude Code's default model), DEMO_TURNS (25).
+# Claude Code's default model), DEMO_TURNS (25), DEMO_MAX_OUT (16000).
 set -euo pipefail
 
 SCRATCH=${SCRATCH_REPO:-metcalfc/tether-scratch}
@@ -69,9 +69,12 @@ printf "node_modules/\n" >.gitignore
 git add -A && git -c user.email=demo@tether -c user.name=demo commit -q -m "duration helper with a failing test" && echo fixture-ok' |
     sed 's/^/  /'
   echo
-  echo "Claude Code (${DEMO_MODEL:-default model}) as claude, in its nono session:"
+  # The default model asks for max_tokens 128000, which tether reserves at
+  # about $3.20 a call: more than the whole $2 session cap (run 28). A lower
+  # output limit is what makes a capped session usable.
+  echo "Claude Code (${DEMO_MODEL:-default model}, max output ${DEMO_MAX_OUT:-16000} tokens) as claude, in its nono session:"
   # Not npm test: npm would run the script through sh, and the sh edge cannot exec node.
-  out=$(sess "cd $repo && ${DEMO_MODEL:+ANTHROPIC_MODEL=$DEMO_MODEL} perl -e 'alarm shift; exec @ARGV' 600 claude -p \
+  out=$(sess "cd $repo && CLAUDE_CODE_MAX_OUTPUT_TOKENS=${DEMO_MAX_OUT:-16000} ${DEMO_MODEL:+ANTHROPIC_MODEL=$DEMO_MODEL} perl -e 'alarm shift; exec @ARGV' 600 claude -p \
     'This repo has a failing test. Run npm install, then node --test to see the failure. Fix the bug in duration.js \
 (not the test), rerun node --test until it passes, commit, and push with: git push origin HEAD:$branch. \
 Then reply in at most three lines: the bug, the fix, and the pushed branch.' \

@@ -127,6 +127,20 @@ escape from the cage was found; Claude Code worked with plain forwarding
 | nono launch cost | Session start (`nono run -- true`) 165 ms; a mediated `git --version` 24 ms/call vs < 1 ms plain (run 17) |
 | Kernel build | ~11 min wall, one attempt (run 6) |
 
+### The demo (run 28)
+
+`spike/record/poc-demo.tape` drives `spike/msb/demo.sh`, one subcommand per
+step of the design's demo script, recorded unattended with VHS 0.12.1 to
+`overnight/run/poc-demo.mp4` (183 s, not committed). All ten steps ran in
+one take, on a fresh tether state dir whose audit chain verifies (66 lines):
+compile; boot (first exec 0.31 s, agent-ready 27.9 s); caps but no key in
+the session env, on disk or in memory; Claude Code on the default model
+fixed a failing test, ran npm install and pushed `agent/demo-20261019030805`
+to the scratch repo ($0.21); the per-tool report; the README injection,
+the postinstall, root after killing nono (attack.sh 21 blocked, 0 failed)
+and the cap replay, all refused and attributed; the overshoot table;
+`tether cap revoke` turning the agent's next call from 200 into 403.
+
 ### Fallbacks taken
 
 None. The day-2 gate passed (Landlock V6), so nono and the per-tool
@@ -169,3 +183,14 @@ a claim:
   the host msb process, not in the guest.
 - Haiku refused the injected README on its own (run 22). The enforcement
   results come from running the same steps as plain commands.
+- Run 28 (the demo): **Claude Code's default model cannot run under a
+  $2 session cap as shipped.** It asks for `max_tokens` 128000, a
+  reservation of about $3.20 a call, so tether refuses the first call
+  before anything is spent. The demo sets `CLAUDE_CODE_MAX_OUTPUT_TOKENS`
+  to 16000 (about $0.48 reserved), and the run then cost $0.21.
+- Run 28 (the demo): **a mediated `git push` failed under nono** until
+  `tether compile` got a fix. git-remote-http spawns `git send-pack`, and
+  the compiled profile had no `git-remote-http -> git` edge. Clones and
+  fetches worked, so runs 17-27 missed it; run 12's 100 MiB push predates
+  nono. The new edge gives send-pack the git cap file (it inherits the
+  `-c include.path`) and no network.

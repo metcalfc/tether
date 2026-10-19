@@ -6,21 +6,22 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 8 item 1 is done (run 27: the RESULTS.md PoC section, the
-remaining measurements, a 30-minute soak and a TLS-context latency fix).
-**Next: milestone 8, item 2: the demo.** Adapt `spike/record/demo.tape` to
-the design's demo script (around line 490 of `design/tether-poc.md`) and
-record it with VHS to `overnight/run/poc-demo.mp4`. If VHS can't drive the
-cage unattended, write the exact commands to `overnight/DEMO.md` instead.
-Before recording:
-- start a **fresh tether state dir**, because the old audit file has
-  pre-chain lines and `audit verify` fails on it (run 21 note);
-- use the plain-command path for the README injection (haiku refuses on its
-  own, run 22);
-- use the default model only for the one demo Claude Code run.
+Milestone 8 items 1 and 2 are done (run 28: the demo is recorded to
+`overnight/run/poc-demo.mp4`). **Next: milestone 8, item 3:
+`overnight/REPORT.md`** (one page at most: what works and what doesn't,
+what was faked or skipped, the acceptance table and numbers from the
+`spike/RESULTS.md` PoC section, fallbacks (none), and the three things to
+look at first). Then item 4: run the real-key `git grep`s from PROMPT.md,
+`make test`, push `poc/tether`, and open a draft PR (`gh pr create --draft`)
+whose body is REPORT.md plus "how to run it" (the demo:
+`vhs spike/record/poc-demo.tape`, or `spike/msb/demo.sh setup`, then `1`
+through `10`, then `teardown`). Then write `DONE` to `overnight/STATUS`.
 
-Watch the frames for secrets. Then do REPORT.md, the key grep, push, the
-draft PR, and DONE.
+Candidates for "look at first": (1) reservations vs Claude Code's default
+model ($3.20 reserved a call, more than the $2 cap; run 28); (2) the
+`git-remote-http -> git` push edge, which runs 17-27 missed; (3) per-tool
+caps give attribution but don't hide a tool's cap from the agent driving
+it (run 17), plus agentd holding caps (run 27).
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -1280,7 +1281,7 @@ Run 26 (2026-10-19) notes:
 ## 8. Demo and write-up
 
 - [x] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
-- [ ] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
+- [x] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
 - [ ] `overnight/REPORT.md` written
 - [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
 - [ ] `DONE` written to `overnight/STATUS`
@@ -1332,6 +1333,56 @@ Run 27 (2026-10-19) notes:
 - Tests: 94 OK (tether 80 + leash 14). ruff, shellcheck and `/bin/bash -n`
   clean.
 
+Run 28 (2026-10-19) notes:
+
+- New: `spike/msb/demo.sh` (host; `setup`, steps `1`-`10`, `teardown`; each
+  step's full output goes to `overnight/run/demo/step-N.log`, and the screen
+  shows a filtered view, saved as `screen-N.log`), `spike/msb/guest/demo.sh`
+  (guest root: `env`, `fix TS`, `call`) and `spike/record/poc-demo.tape`.
+  `setup` moves the old state dir aside to `state.pre-demo-<ts>` (nothing is
+  deleted), so the demo's audit chain verifies from line 1.
+- **Recorded:** `overnight/run/poc-demo.mp4`, 183 s, 1.5 MB, all ten steps
+  in one take (the third attempt; see below). I extracted a frame every 6 s
+  and looked at them, and grepped the screen logs for real-key shapes and
+  unredacted caps: there are none. Caps on screen read `tth_REDACTED`.
+  `tether audit verify` on the demo's state: 66 lines, chain intact.
+- **On camera:** compile (msb.args, 2 nono profiles, tether.json); boot to
+  first exec 0.31 s, agent-ready 27.9 s; claude's session env has only
+  caps, its tool caps are unreadable, root's disk grep finds 0 real keys,
+  memscan finds 0 (control found); **Claude Code on the default model
+  fixed `ms(seconds)` to `ms(seconds * 1000)`, ran npm install and
+  `node --test`, and pushed `agent/demo-20261019030805`** (the remote has
+  `d9964fe`), $0.2094 in 4 calls; `report --by tool`; readme 4/4 PASS;
+  pkg 5/5 PASS; root: attack.sh 21 blocked and 0 failed after the nono
+  kill, advcheck PASS; replay 403/403/403 off-channel and 200 on, 9 PASS;
+  overshoot as in run 26; revoke: 200, then 403.
+- **Finding 1, fixed: mediated `git push` was broken under nono.**
+  git-remote-http spawns `git send-pack`, and the profile had no
+  `git-remote-http -> git` edge. Clones and fetches don't need it, so runs
+  17-27 never saw it (run 12's push predates nono). Tried in the guest
+  first: `can_use: ["git"]` alone gives "no policy edge"; an edge without
+  the cap file fails with "unable to access /run/tether/claude/git",
+  because send-pack inherits `-c include.path`. The working edge has the
+  git fs grants, the cap file, git's env allowlist and no network.
+  `tether compile` emits it (commit `eaee408`), with a unit test
+  (`test_git_push_edge`). Tests: 95 OK.
+- **Finding 2: the default model can't run under the $2 cap.** Claude Code
+  sends `max_tokens` 128000, tether reserves about $3.28 for the call, and
+  the first call is a 403 (`spend:session`) before anything is spent (the
+  second recording attempt). The demo now sets
+  `CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000` (`DEMO_MAX_OUT`), about $0.48
+  reserved. This is run 26's under-admission at full size. It's in the
+  design's Corrections and in RESULTS.
+- The first attempt failed in the tape: `Wait+Screen /host\$ $/` never
+  matches, because `$` anchors to the end of the screen. `setup` now
+  prints a marker the typed command doesn't contain (`READY-$((1+1))`).
+- Odd, not chased: Claude Code makes 3 CONNECTs to registry.npmjs.org from
+  the agent's own cap (refused; that's npm's egress, not the agent's),
+  probably its update check. The haiku dry run also tried
+  `/github/metcalfc/imp` (refused by the route paths).
+- Haiku dry run of step 4 (before the push fix): it fixed the bug, and the
+  push failed with the nono chain error, which is how finding 1 surfaced.
+
 ## Spend log
 
 | Run | Model calls | USD (from tether report) |
@@ -1347,6 +1398,7 @@ Run 27 (2026-10-19) notes:
 | 23 | 2 (haiku, Claude Code Bash tool check with the sh edge) + 1 refused ($0) | $0.0413 |
 | 26 | 14 allowed + 6 refused at admission (haiku, four-stream overshoot, host tether) | $0.012816 |
 | 27 | 444 via tether (300 soak, 144 TTFB bench, haiku) + ~140 direct bench calls | $0.1565 via tether; direct est. < $0.01 |
+| 28 | 4 default model (demo step 4), 10 haiku (step 4 dry run), 14 haiku (step 9) | $0.3016 ($0.2094 + $0.0794 + $0.0128) |
 
 ## Decisions and corrections
 
@@ -1374,3 +1426,7 @@ Run 27 (2026-10-19) notes:
   in place, and its mediated tools fail closed (rc 126). Nothing in the guest
   holds the network policy. attack.sh's key probe now matches a real key's
   shape only, because nono's binary embeds `sk-ant-oat01-{}`.
+- Run 28: `tether compile` emits a `git-remote-http -> git` edge, so a
+  mediated push works under nono. The demo bounds Claude Code's output
+  (`CLAUDE_CODE_MAX_OUTPUT_TOKENS=16000`), because the default model's
+  128000 `max_tokens` reserves more than the $2 session cap.
