@@ -6,6 +6,7 @@
 #   nono.sh put AGENT NAME   store stdin (a tether env file) as /run/tether/AGENT/NAME
 #   nono.sh run AGENT CMD..  run CMD as AGENT inside its session sandbox
 #   nono.sh check            prove who holds which cap, and what each can reach
+#   nono.sh proc             try /proc and ptrace routes to another tool's cap
 #
 # Each agent's session sandbox (Landlock V6, as the agent's UID) gets /work,
 # a few dot-directories in its home and TCP connect to the gateway port only.
@@ -266,10 +267,124 @@ cmd_check() {
   return "$FAILS"
 }
 
+# Every process owned by USER, one pid per line.
+pids_of() { # pids_of USER
+  local uid p
+  uid=$(id -u "$1")
+  for p in /proc/[0-9]*; do
+    [[ $(stat -c %u "$p" 2>/dev/null) == "$uid" ]] && printf '%s\n' "${p#/proc/}"
+  done
+  return 0
+}
+
+probe_as() { # probe_as LABEL CMD..: run procprobe on $TARGETS through CMD, print and return its lines
+  local label=$1; shift
+  log "$label"
+  # shellcheck disable=SC2086 # a pid list
+  "$@" python3 "$PROBE" $TARGETS 2>&1 | sed 's/^/    /' || true
+}
+
+cmd_proc() {
+  local a b scratch=${SCRATCH_REPO:-metcalfc/tether-scratch} hpid line p
+  # shellcheck disable=SC2086 # split the agent list on purpose
+  set -- $AGENTS
+  a=$1 b=$2
+  PROBE=/opt/tether/procprobe.py
+  install -m 0755 /opt/leash/procprobe.py "$PROBE"
+  rm -rf "/tmp/npminit-$a" && install -d -m 0700 -o "$a" -g "$a" "/tmp/npminit-$a"
+
+  # A listener that accepts and never answers, for the leash-style control.
+  python3 -c 'import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(("127.0.0.1", 8081)); s.listen(8); c=[]
+while True: c.append(s.accept())' >/dev/null 2>&1 &
+  hpid=$!
+
+  log "$a's session with mediated git, git-remote-http and npm held open (60 s)"
+  # Both block on stdin: git-remote-http waits for helper commands (it has
+  # already read its config, cap included), npm init for a package name.
+  as_agent "$a" "$BIN/agent-session" bash -c "cd /tmp/npminit-$a;
+    sleep 60 | git remote-http origin https://github.com/$scratch & sleep 60 | npm init & wait" >/dev/null 2>&1 &
+  sleep 4
+  TARGETS=$(pids_of "$a" | tr '\n' ' ')
+  log "targets (all $a-owned processes):"
+  for p in $TARGETS; do printf '    %s %s: %s\n' "$p" "$(cat /proc/"$p"/comm 2>/dev/null)" "$(tr '\0' ' ' </proc/"$p"/cmdline 2>/dev/null | cut -c1-110)"; done
+
+  local root sa sb ua ub ctl
+  root=$(probe_as "ground truth: root, no Landlock" env)
+  printf '%s\n' "$root"
+  sa=$(probe_as "$a's own session sandbox (Landlock) against its tools" as_agent "$a" "$BIN/agent-session")
+  printf '%s\n' "$sa"
+  sb=$(probe_as "$b's session sandbox against $a's processes" as_agent "$b" "$BIN/agent-session")
+  printf '%s\n' "$sb"
+  ua=$(probe_as "control: $a's UID with no sandbox" as_agent "$a")
+  printf '%s\n' "$ua"
+  ub=$(probe_as "control: $b's UID with no sandbox" as_agent "$b")
+  printf '%s\n' "$ub"
+
+  # /proc/<pid>/fd/ is listable by the same UID without the ptrace check.
+  # A process that holds its cap file open: can a sandbox reopen it there?
+  log "control: an unsandboxed $a process holds /run/tether/$a/git open on fd 3"
+  as_agent "$a" bash -c "exec 3</run/tether/$a/git; exec sleep 30" &
+  sleep 1
+  TARGETS=""
+  for p in $(pids_of "$a"); do [[ $(readlink "/proc/$p/fd/3" 2>/dev/null) == "/run/tether/$a/git" ]] && TARGETS+="$p "; done
+  local fdr fda fdb
+  fdr=$(probe_as "  ground truth: root reopens it" env)
+  printf '%s\n' "$fdr"
+  fda=$(probe_as "  $a's session reopens /proc/<pid>/fd/3" as_agent "$a" "$BIN/agent-session")
+  printf '%s\n' "$fda"
+  fdb=$(probe_as "  $b's session reopens /proc/<pid>/fd/3" as_agent "$b" "$BIN/agent-session")
+  printf '%s\n' "$fdb"
+
+  # The leash-style delivery: the cap in a url rewrite. git hands the
+  # rewritten URL to git-remote-http as argv. Fake cap, hung listener.
+  log "control: leash-style env delivery (fake cap tth_fakecontrol in a url rewrite)"
+  as_agent "$a" env GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=url.http://agent:tth_fakecontrol@127.0.0.1:8081/github/.insteadOf \
+    GIT_CONFIG_VALUE_0=https://github.com/ GIT_TERMINAL_PROMPT=0 /usr/bin/git ls-remote "https://github.com/$scratch" >/dev/null 2>&1 &
+  sleep 2
+  TARGETS=""
+  for p in $(pids_of "$a"); do [[ $(cat /proc/"$p"/comm 2>/dev/null) == git-remote-http ]] && TARGETS+="$p "; done
+  ctl=$(probe_as "  $b's session reads the helper's cmdline" as_agent "$b" "$BIN/agent-session")
+  printf '%s\n' "$ctl"
+
+  kill "$hpid" 2>/dev/null || true
+  for p in $(pids_of "$a"); do kill "$p" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+
+  log "verdicts"
+  for line in "$sa" "$sb" "$fda" "$fdb"; do
+    while IFS= read -r l; do
+      case $l in
+        *'ok+CAP'*) fail "cap readable: $l" ;;
+      esac
+    done <<<"$line"
+  done
+  # What the tools hold must actually be there, or the refusals above prove nothing.
+  expect "ground truth: the agent session's environ holds its cap" "environ=ok+CAP" "$root"
+  expect "ground truth: npm holds its cap in memory" "npm init:" "$(grep 'mem=ok+CAP' <<<"$root")"
+  expect "ground truth: git-remote-http holds the git cap in memory" "git-remote-http:" "$(grep 'mem=ok+CAP' <<<"$root")"
+  # The pids that hold a cap (root's view), and what each sandbox got from them.
+  local held
+  held=$(grep -E 'environ=ok\+CAP|mem=ok\+CAP' <<<"$root" | awk '{print $1}' | tr '\n' '|')
+  held=${held%|}
+  expect_not "$a's session: no environ, mem, vm_readv or ptrace on any cap holder" "$a" "=ok" \
+    "$a $(grep -E "^ *($held) " <<<"$sa" | grep -oE '(environ|mem|ptrace|vm_readv)=ok[^ ]*' | tr '\n' ' ')"
+  expect_not "$b's session: no environ on any of $a's processes" "$b" "environ=ok" "$b $(grep -oE 'environ=[^ ]*' <<<"$sb" | grep 'ok' | tr '\n' ' ')"
+  expect "ground truth: the held fd reopens to the cap" "fd=ok+CAP" "$fdr"
+  expect "$a's session lists a held cap fd but reopens no fd at all" "fds, 0 reopened" "$fda"
+  expect "$b's session cannot list it" "fd=EACCES" "$fdb"
+  expect "control: $a's unsandboxed UID reads its processes' environ (Landlock, not Unix perms, refuses)" "environ=ok+CAP" "$ua"
+  expect_not "control: $b's UID is refused by Unix perms" "$b" "environ=ok" "$b $(grep -oE 'environ=[^ ]*' <<<"$ub" | grep 'ok' | tr '\n' ' ')"
+  expect "control: leash-style url rewrite leaks the cap through cmdline, even to $b's sandbox" "cmdline=ok+CAP" "$ctl"
+  rm -rf "/tmp/npminit-$a"
+  echo "  $FAILS failed"
+  return "$FAILS"
+}
+
 case "${1:-}" in
   setup) cmd_setup ;;
   put) shift; cmd_put "$@" ;;
   run) shift; cmd_run "$@" ;;
   check) cmd_check ;;
+  proc) cmd_proc ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

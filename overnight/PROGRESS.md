@@ -6,26 +6,20 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 5 item 2 is done (run 17). **Next: milestone 5, item 3: verify one
-tool can't read another's capability through `/proc`.** Boot as below, then
-`spike/msb/cage.sh users && spike/msb/cage.sh nono` (setup, caps, 19-line
-check). Then, from claude's session sandbox (`nono.sh run claude bash -c
-...`), while a mediated `git clone` and `npm view` run in the background:
-read `/proc/<pid>/environ`, `/proc/<pid>/cmdline`, `/proc/<pid>/maps` and
-`/proc/<pid>/fd/*` of the git, git-remote-http and node processes (find pids
-by scanning `/proc/*/comm`), try `ptrace`/`process_vm_readv` (python ctypes)
-and `gdb`-less `/proc/<pid>/mem` reads, and grep for `tth_`. Expect Landlock's
-ptrace scoping to refuse environ/mem/fd (the tools run in sibling Landlock
-domains), and expect cmdline to be readable but cap-free (the cap is in a
-header from a file, not argv). Also do it from codex's session against
-claude's tools, and as a **control** run the same reads from an unsandboxed
-claude shell (`setpriv --reuid claude ...` without nono) to show it is
-Landlock, not Unix perms, doing the work. A second control: the leash-style
-env delivery (`GIT_CONFIG_KEY_0=url.http://agent:<cap>@...`) puts the cap in
-`git-remote-http`'s argv; show that `/proc/<pid>/cmdline` leaks it, which is
-why the gitconfig format uses a header. Script it as `nono.sh proc` +
-`cage.sh proc`. Record results in PROGRESS and keep `spike/RESULTS.md` for
-milestone 8.
+Milestone 5 is done (run 18). **Next: milestone 6, item 1: `tether
+compile`.** This starts a new milestone, so re-read `design/tether-poc.md`
+first (the policy model and compiler sections). One policy file should emit
+(a) the msb flags `cage.sh up` passes today (`--net-default deny --net-rule
+allow@host:tcp:P --tmpfs /run/tether ...`), (b) the nono profiles that
+`spike/msb/guest/nono.sh write_profile` builds in python today (move that
+logic into tether, so nono.sh only installs the emitted JSON), and (c)
+tether's own config (sandboxes, routes, egress, per-agent and per-tool cap
+grants that `cage.sh agent_grants`/`tool_grants` hard-code today). Subset
+checks: every cap's routes/egress must be inside the ceiling, every tool's
+grants inside its agent's sandbox; wildcard lints (e.g. `*.github.com` in
+egress, `**` routes). Unit tests in `tests/test_tether.py`, then prove it in
+the cage by booting from compiled output and rerunning `cage.sh nono` and
+`cage.sh proc` (both should stay 19/19 and 11/11).
 
 Cage env used in runs 11 and 16 (tether as the gateway, Landlock kernel):
 
@@ -692,7 +686,7 @@ Run 15 (2026-10-19) notes:
 
 - [x] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
 - [x] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
-- [ ] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
+- [x] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
 
 Run 16 (2026-10-19) notes:
 
@@ -827,6 +821,56 @@ Run 17 (2026-10-19) notes:
 - **Launch cost:** session start (`nono run -- true`) **165 ms**; mediated
   `git --version` **24 ms/call** vs <1 ms plain (10 runs each).
 - Boot to first exec 0.42 s. No model calls this run.
+
+Run 18 (2026-10-19) notes:
+
+- New: `spike/msb/guest/procprobe.py` (for each pid, tries cmdline,
+  environ, maps, list + non-blocking reopen of every `/proc/PID/fd/N`, a
+  scan of `/proc/PID/mem`, `process_vm_readv` and `PTRACE_ATTACH`; prints
+  `ok`, `ok+CAP` or the errno, never the cap; matches `tth_` and git's
+  base64 `agent:tth`), `nono.sh proc`, `cage.sh proc`. `cage.sh push` now
+  copies `guest/*.py` too.
+- Setup: claude's session holds open a mediated `git remote-http` (waits on
+  stdin for helper commands, config and cap already loaded) and `npm init`
+  (waits for a package name). Process tree: the session's `git`/`npm` are
+  nono shims; the real `git -c include.path=/run/tether/claude/git`, the
+  real `git-remote-http` and `npm init` are **children of the nono
+  supervisor**, each in its own command-sandbox Landlock domain, a sibling
+  of the session's. Root's ground truth: the session's bash/sleep/shims
+  have the agent cap in `environ`; real git, git-remote-http and npm have
+  **no cap in environ but have it in memory** (git's base64 header, npm's
+  proxy URL). nono's supervisor is non-dumpable (even claude's own
+  unsandboxed UID gets EACCES on it).
+- **`cage.sh proc`: 11/11 PASS.**
+  - claude's session (Landlock) against all 10 claude-owned processes,
+    including its own tools and a sibling session's bash: environ, maps,
+    mem → EACCES; ptrace → EPERM; process_vm_readv has no address to try
+    (maps refused). cmdline readable, no cap in it.
+  - codex's session against claude's processes: everything but cmdline
+    refused.
+  - **Control 1:** claude's UID with no sandbox reads environ, mem, maps,
+    and ptraces every one of those processes (except nono's supervisor), so
+    the refusals above come from Landlock domain scoping, not Unix perms.
+    codex's unsandboxed UID is refused by Unix perms (different UID).
+  - **Control 2:** leash-style delivery (`GIT_CONFIG_KEY_0=url.http://agent:<cap>@...`,
+    fake cap, hung listener on guest 127.0.0.1:8081): `/proc/<git-remote-http>/cmdline`
+    shows the cap, **readable even from codex's Landlock session** (cmdline
+    has no ptrace check). Confirms the gitconfig `extraHeader` choice.
+  - **fd finding:** `/proc/<pid>/fd/` of a same-UID process can be
+    **listed** from inside the session (generic permission, no ptrace
+    check), so fd targets are visible (readlink). Reopening is refused: the
+    claude session reopened **0** fds of any of its tools or of an
+    unsandboxed claude process holding `/run/tether/claude/git` on fd 3,
+    not even pipes or /dev/null. Root reopens that fd and finds the cap.
+    codex cannot list it at all.
+- No design correction needed: the two "(verify)" claims (Landlock blocks
+  reading other domains' `/proc/*/environ`; reading git's cap from
+  `/proc/<git>/environ`) hold, and also cover mem, ptrace and fd reopen.
+  Caveat for the write-up: the cap's safety from the agent's *own* other
+  processes relies on every agent process being inside nono; a claude-UID
+  process outside nono can read everything above.
+- Tests: tether 60 + leash 14 = 74 OK (no tether change). shellcheck,
+  `/bin/bash -n` and ruff clean. Boot to first exec 0.38 s. No model calls.
 
 ## 6. Compiler and conformance
 

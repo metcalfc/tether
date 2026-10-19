@@ -23,6 +23,8 @@
 #                      each into the guest's /run/tether (never on host disk)
 #   cage.sh nono       nono profiles + launchers (guest/nono.sh setup), caps,
 #                      then prove them (nono.sh check); run `users` first
+#   cage.sh proc       /proc and ptrace routes to another tool's or agent's
+#                      cap (guest/nono.sh proc); run `nono` first
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -106,12 +108,12 @@ push_files() {
   limit 60 "$MSB" copy "$env" "$NAME:$GUEST_ENV"
   limit 30 "$MSB" exec "$NAME" -- chmod 600 "$GUEST_ENV"
   limit 30 "$MSB" exec "$NAME" -- mkdir -p "$GUEST_DIR"
-  for f in "$HERE"/guest/*.sh; do
+  for f in "$HERE"/guest/*.sh "$HERE"/guest/*.py; do
     [[ -f $f ]] || continue
     limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$f")"
     limit 30 "$MSB" exec "$NAME" -- chmod +x "$GUEST_DIR/$(basename "$f")"
   done
-  log "pushed $GUEST_ENV and $GUEST_DIR/*.sh"
+  log "pushed $GUEST_ENV and $GUEST_DIR/*.{sh,py}"
 }
 
 cmd_exec() {
@@ -224,6 +226,11 @@ cmd_nono() {
   limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" check
 }
 
+# Can one tool, or another agent, read a cap through /proc or ptrace? Run `nono` first.
+cmd_proc() {
+  limit 300 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" proc
+}
+
 cmd_down() {
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
@@ -239,7 +246,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  gw-up | gw-down | up | check | push | attack | works | users | caps | nono | down | status) "cmd_${1//-/_}" ;;
+  gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,32p' "$0"; exit 2 ;;
+  *) sed -n '2,34p' "$0"; exit 2 ;;
 esac
