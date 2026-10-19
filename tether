@@ -254,6 +254,9 @@ class Policy:
         self.cap_session: float | None = sp.get("per_session_usd_per_day")
         self.cap_total: float | None = sp.get("total_usd_per_day")
         self.max_inflight: int = int(sp.get("max_inflight", 4))
+        # false: admit on `spent < cap` alone and charge at the end (leash's
+        # check-then-charge), so calls in flight can all overshoot. For measuring.
+        self.reserve: bool = bool(sp.get("reserve", True))
         self.prices: dict[str, list[float]] = cfg.get("prices_per_mtok", {"default": [5, 25]})
         # From `tether compile`: what each agent's cap and each of its tools' caps may do.
         self.grants: dict[str, Any] = cfg.get("grants", {})
@@ -1479,7 +1482,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 return
             res = None
             if billable(route, self.command, rest):
-                est = reserve_usd(gw.p.prices, body.data)
+                est = reserve_usd(gw.p.prices, body.data) if gw.p.reserve else 0.0
                 res, blocked, spend_rule = gw.admit(cap, est)
                 if blocked:
                     est_usd = round(est, 6)
@@ -1766,7 +1769,7 @@ POLICY_KEYS = {
     "gateway": {"credentials", "routes", "egress", "spend"},
     "route": {"upstream", "credential", "inject", "paths", "meter"},
     "egress": {"deny_private", "ports", "allow_addresses"},
-    "spend": {"prices", "session_usd_per_day", "total_usd_per_day", "max_inflight"},
+    "spend": {"prices", "session_usd_per_day", "total_usd_per_day", "max_inflight", "reserve"},
     "agent": {"fs", "routes", "egress", "spend_usd", "settings", "tools"},
     "tool": {"fs", "routes", "egress", "spend_usd", "argv_prepend", "scripts"},
     "fs": {"write", "write_file", "read", "deny"},
@@ -2057,6 +2060,8 @@ def compile_policy(src: Path) -> tuple[dict[str, Any], Lints]:
     sp = lints.keys("gateway.spend", "spend", gw.get("spend", {}))
     csp = lints.keys("ceiling.spend", "spend", ceil.get("spend", {}))
     ceiling_cap = csp.get("session_usd_per_day")
+    if sp.get("reserve", True) is not True:
+        lints.warnings.append("gateway.spend.reserve: off; calls in flight can all overshoot the cap")
     session_cap = sp.get("session_usd_per_day", ceiling_cap)
     if session_cap is not None and ceiling_cap is not None and session_cap > ceiling_cap:
         lints.errors.append(f"gateway.spend.session_usd_per_day ${session_cap} is above the ceiling's ${ceiling_cap}")
@@ -2189,6 +2194,7 @@ def compile_policy(src: Path) -> tuple[dict[str, Any], Lints]:
             "per_session_usd_per_day": session_cap,
             "total_usd_per_day": sp.get("total_usd_per_day"),
             "max_inflight": sp.get("max_inflight", 4),
+            "reserve": sp.get("reserve", True) is True,
         },
         "prices_per_mtok": prices,
         "grants": grants,

@@ -1624,6 +1624,31 @@ class ReservationTest(TwoSandboxes):
         self.assertAlmostEqual(tether.reserve_usd(prices, b"abcd" * 10), 10 / 1e6)
         self.assertEqual(tether.reserve_usd(prices, None), 0.0)
 
+    def test_reserve_off_admits_every_call_in_flight(self) -> None:
+        # check-then-charge: nothing is spent while both are in flight, so both
+        # get in and the session ends above its cap; the next call is refused
+        self.policy.reserve = False
+        a = self.start(self.OPUS)
+        b = self.start(self.OPUS)
+        self.assertEqual(HoldUpstream.posts, 2)
+        self.assertEqual(self.ledger().held["o1"], 0.0)
+        for t, out, go in (a, b):
+            self.finish(t, go)
+            self.assertEqual(out["status"], 200)
+        self.assertAlmostEqual(self.ledger().spent["o1"], 0.0153, places=8)
+        self.ledger().spent["o1"] = 1.2  # as if the calls had cost their worst case
+        st, body = self.slow_post(self.OPUS)
+        self.assertEqual(st, 403)
+        self.assertIn("reached", json.loads(body)["error"]["message"])
+        # max_inflight still holds with reservations off
+        self.ledger().spent["o1"] = 0.0
+        a = self.start(self.OPUS)
+        b = self.start(self.OPUS)
+        st, _ = self.slow_post(self.OPUS)
+        self.assertEqual(st, 403)
+        for t, _, go in (a, b):
+            self.finish(t, go)
+
     def test_settle_is_idempotent(self) -> None:
         led = self.ledger()
         r, why, _ = led.reserve("o1", 0.5, 1.0, None, 4)
@@ -1674,6 +1699,20 @@ class CompileTest(unittest.TestCase):
         cred = out["tether"]["routes"]["anthropic"]["credential"]
         self.assertEqual(cred, "cmd:security find-generic-password -s tether-anthropic -w")
         self.assertEqual(out["settings"], {"claude": {"skipWebFetchPreflight": True}})
+
+    def test_spend_reserve_knob(self) -> None:
+        out, lints = self.compile()
+        self.assertIs(out["tether"]["spend"]["reserve"], True)
+        self.assertFalse([w for w in lints.warnings if "reserve" in w])
+        cfg = json.loads(json.dumps(self.src))
+        cfg["gateway"].setdefault("spend", {})["reserve"] = False
+        out, lints = self.compile(cfg)
+        self.assertEqual(lints.errors, [])
+        self.assertIs(out["tether"]["spend"]["reserve"], False)
+        self.assertIn("gateway.spend.reserve: off; calls in flight can all overshoot the cap", lints.warnings)
+        p = self.dir / "tether.json"
+        p.write_text(json.dumps(out["tether"]))
+        self.assertFalse(tether.Policy(p).reserve)
 
     def test_nono_profile_shape(self) -> None:
         out, lints = self.compile()

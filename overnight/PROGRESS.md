@@ -6,17 +6,18 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 7 item 4 (cap replayed from a second sandbox) is done (run 25).
-**Next: milestone 7, item 5: four concurrent streams against the cap; record
-the overshoot, with and without reservations.** Plan: check what run 14
-already measured (spend log: "3 allowed + 4 refused at admission"). If it
-covers this, rerun it from the cage as claude: four parallel streaming
-`/anthropic/v1/messages` calls (haiku, short prompts) against a
-session cap set just above one call's reservation. Then measure the
-overshoot (spend minus cap) once with reservations on and once with them
-off (does tether have a switch? if not, add a policy knob plus a unit test).
-Keep the cap tiny (cents) so the test is cheap. Record both numbers here and
-in the milestone-8 RESULTS table. After that: milestone 8.
+Milestone 7 is done (run 26: four-stream overshoot, see its notes).
+**Next: milestone 8, item 1: the PoC section of `spike/RESULTS.md`.** Read
+the design's "Success criteria" and "Measurements" lists (around lines
+506-520 of `design/tether-poc.md`), then mark each one pass, fail or not run,
+with numbers taken from the run notes below: boot to agent-ready and TTFB
+(runs 4-5), CONNECT setup, kernel/Landlock (run 6), caps and the adversarial
+suite (runs 22-25), overshoot (run 26). List every fallback taken (none at
+the Day-2 gate) and every design correction. Any measurement the design asks
+for that no run took (for example `npm install` on guest disk vs virtio-fs,
+200 MB `git push` throughput, msb/guest memory, nono launch cost) is either
+measured cheaply in that run or marked "not run". Don't invent numbers.
+Then: demo (item 2), REPORT.md, push, PR, DONE.
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -1048,7 +1049,7 @@ Run 21 (2026-10-19) notes:
 - [x] Malicious npm package fixture (postinstall)
 - [x] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
 - [x] Capability replayed from a second sandbox gets a 403
-- [ ] Four concurrent streams against the cap; record the overshoot
+- [x] Four concurrent streams against the cap; record the overshoot
 
 Run 22 (2026-10-19) notes:
 
@@ -1233,6 +1234,46 @@ Run 25 (2026-10-19) notes:
 - Tests: 91 OK (tether 77 + leash 14, no tether change). shellcheck,
   `/bin/bash -n` and ruff are clean. Logs: `overnight/run/run25-{boot,replay}.log`.
 
+Run 26 (2026-10-19) notes:
+
+- Run 14 measured two concurrent calls, not four, and never measured
+  reservations off: tether had no switch. New: **`spend.reserve`** (default
+  true). With false, admission reserves $0, so a call is admitted while
+  `spent < cap` and charged at the end, which is leash's check-then-charge.
+  `max_inflight` still applies. `tether compile` passes `gateway.spend.reserve`
+  through and warns when it is off. 2 new unit tests:
+  `test_reserve_off_admits_every_call_in_flight` (two held opus calls both
+  admitted, the session ends above its cap, the next call is refused
+  "reached", max_inflight still refuses) and `test_spend_reserve_knob`
+  (compile output, warning, Policy). Tests: 93 OK (tether 79 + leash 14).
+  ruff, shellcheck and `/bin/bash -n` clean.
+- New: `spike/msb/overshoot.sh`. It runs a live `tether serve` on the host
+  at 127.0.0.1:18141 (the spend path doesn't depend on the cage, so I didn't
+  boot it), once with `reserve: true` and once with `false`. Each scenario
+  mints a fresh sub-capped cap, fires **four streaming haiku calls at once**,
+  then sends one more after they settle. Log: `overnight/run/run26-overshoot.log`.
+
+  | scenario | reserve | admitted of 4 | next call | spent | cap | overshoot |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | max_tokens 400, "count to 300" (reserve $0.002035, cost $0.002021) | on | 2 | 403 | $0.004042 | $0.005 | **-$0.000958 (none)** |
+  | same | off | 4 | 403 "reached ($0.0081 of $0.0050)" | $0.008084 | $0.005 | **+$0.003084 (62 % of the cap, 1.5 calls)** |
+  | max_tokens 4096, "Say hi." (reserve $0.020507, cost ~$0.00009) | on | 2 | 200 | $0.000260 (3 calls) | $0.05 | none; 2 calls refused that would have fit |
+  | same | off | 4 | 200 | $0.000430 (5 calls) | $0.05 | none |
+
+  - **The criterion "with 4 concurrent streams, overshoot stays within one
+    reservation" passes.** With reservations on, the overshoot is zero
+    here: estimates are upper bounds when output reaches max_tokens (0.7 %
+    above the metered cost). Off, all four get in and overshoot is
+    (calls in flight x cost) - headroom, as the design predicted for leash.
+  - **The cost of reservations is under-admission.** A Claude-Code-shaped
+    call (large max_tokens, short answer) reserves about 230x what it costs,
+    so two of four were refused while the cap was 99.5 % unspent. These are
+    non-retryable 403s, so the client sees a hard failure, not a wait. The
+    session cap has to be sized against max_tokens x output price x
+    max_inflight, not against expected spend. That's worth a line in the
+    report.
+- Spend: 14 allowed haiku calls, $0.012816 (from the audit's usd fields).
+
 ## 8. Demo and write-up
 
 - [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
@@ -1254,6 +1295,7 @@ Run 25 (2026-10-19) notes:
 | 21 | 2 (haiku, Claude Code via tether in the cage) | $0.0781 |
 | 22 | 2 (haiku, Claude Code refusing the injected README) | $0.0439 |
 | 23 | 2 (haiku, Claude Code Bash tool check with the sh edge) + 1 refused ($0) | $0.0413 |
+| 26 | 14 allowed + 6 refused at admission (haiku, four-stream overshoot, host tether) | $0.012816 |
 
 ## Decisions and corrections
 
