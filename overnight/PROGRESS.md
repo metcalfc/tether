@@ -6,22 +6,25 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 4: **per-cap policy intersected with the ceiling.** Each
-registry record already carries `routes`, `egress` and `spend_usd` (None =
-whatever the ceiling allows); `tether cap mint --route R --egress H --spend
-USD` sets them and rejects unknown route names, but **nothing enforces them
-yet**. Enforce in the handler, after `identify`: a route not in
-`cap["routes"]` gets 403 (audit `rule`-style reason "route not granted to
-this cap"); a CONNECT host must match both the policy allowlist (ceiling)
-and `cap["egress"]` if set; `spend_usd` is a per-cap daily sub-cap (Ledger
-needs a second key, e.g. `cap:<cap_id>`, next to the session). Mint should
-refuse an egress pattern that is not inside the ceiling (subset check:
-every cap pattern must be matched by, or equal to, a ceiling pattern; treat
-a cap wildcard wider than the ceiling as an error). Unit tests: cap C with
-routes [anthropic] gets 403 on /github/; npm cap with egress
-[registry.npmjs.org] can't CONNECT to pypi.org even though the ceiling
-allows it; sub-cap refuses the next call while the session still has
-budget; mint with a wider egress than the ceiling fails.
+Milestone 3, item 5: **CONNECT hardening** (design "Changes from today's
+leash", item 4). In `do_CONNECT`, after `egress_ok`: refuse IP-literal
+CONNECT targets; resolve the name on the host (`socket.getaddrinfo`); refuse
+if any resolved address is loopback, RFC 1918, link-local (169.254/16,
+fe80::/10), metadata (169.254.169.254, fd00:ec2::254), CGNAT (100.64/10),
+ULA (fc00::/7), unspecified or multicast, unless the policy allowlists that
+address (new `egress.allow_addresses: [CIDR...]`; use `ipaddress`); then
+connect to the checked address, not the name (no second lookup). SNI: after
+the 200, peek the guest's first bytes, parse the TLS ClientHello's
+server_name and refuse (close, audit `deny`) unless it equals the CONNECT
+host; no SNI / ECH / not TLS fails closed. **The existing tests CONNECT to
+`localhost` (loopback) on an echo server that is not TLS**: give the test
+policies `allow_addresses: ["127.0.0.1/32"]` and make the echo tests send a
+minimal ClientHello with SNI `localhost` (build one by hand in the test, or
+use `ssl.MemoryBIO` + `SSLContext.wrap_bio(server_hostname=...)` to produce
+real ClientHello bytes). Unit tests: IP literal refused; a name resolving to
+127.0.0.1 refused without the allowlist; SNI mismatch refused; plain non-TLS
+bytes refused; the audit has the resolved address. Real run: from the cage,
+`curl --proxy ... https://registry.npmjs.org/` still 200 and works.sh passes.
 Boot the cage with the Landlock kernel when a VM is needed:
 `export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
 (rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
@@ -271,7 +274,7 @@ Run 6 (2026-10-18) notes:
 - [x] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
 - [x] Channel binding: one listener per sandbox
 - [x] Capability registry: `tether cap mint|revoke|list`, minted per boot
-- [ ] Per-cap policy intersected with the ceiling
+- [x] Per-cap policy intersected with the ceiling
 - [ ] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [ ] Streamed request bodies (large `git push`)
 - [ ] `Upgrade` passthrough on routes
@@ -378,6 +381,51 @@ Run 9 (2026-10-18) notes:
   cap_c07fe1b17409 of session chad-dev is revoked`.
 - No model calls this run, no VM booted.
 
+Run 10 (2026-10-18) notes:
+
+- **Ceiling** = the policy's `routes` (with a resolved credential),
+  `egress.allow` and `spend` caps. A cap record's `routes`, `egress` and
+  `spend_usd` narrow it; None = no narrowing. Enforced in serve on every
+  request, so a hand-edited `caps.json` still can't widen the ceiling:
+  - **routes:** `Gateway.route_ok` after `identify`; an ungranted route gets
+    **403** "route /x/ is not granted to this capability", audited as
+    `route github not granted to capability cap_...`, never reaches upstream.
+  - **egress:** `egress_ok(host, port, cap)` checks port, credentialed host,
+    the ceiling allowlist, then the cap's grant ("host is not in capability
+    cap_...'s egress grant"). 403 before any connect.
+  - **spend:** `Ledger` has a second map `caps` (`{cap_id: usd}`) next to
+    `spent`, kept separate so the team total doesn't double-count; only caps
+    with a `spend_usd` are tracked there. `cap_check(cap)` checks session,
+    team, then the sub-cap. Refusal is 403 (non-retryable), like the others.
+- **Mint-time subset check** (`grant_errors`): unknown route; an egress
+  pattern not inside some ceiling pattern (`pattern_within`: equal, or a
+  literal host the ceiling matches, or a `*` pattern the ceiling matches as a
+  string *when the ceiling has no `?`/`[`*, since a `?` in the ceiling would
+  match one `*`); `?`/`[]` in a cap pattern is refused outright; a negative
+  sub-cap, or one above the session cap. Error: `tether: cap must fit inside
+  the ceiling: ...`.
+- **Tests:** `TwoSandboxes.configure()` hook; `CapPolicyTest` (4): route not
+  granted (403, no upstream call; session cap still gets github); npm cap
+  egress [registry.npmjs.org] refused pypi.org (ceiling allows it) and
+  localhost, a localhost-granted cap tunnels, and a `["*"]` grant can't widen
+  the ceiling; sub-cap $0.50 refuses call 2 while the session ($5 cap) still
+  succeeds, ledger `caps` = {cid: 1.0}, `spent` = {o1: 2.0}; mint refuses `*`,
+  `*.npmjs.org` (ceiling has only the literal), `example.com`, `?ypi.org`,
+  disabled route `openai`, spend 6 > 5, and accepts `files.pythonhosted.org`,
+  `*.pythonhosted.org`, spend 5. `make test`: **46 tests OK** (leash 14
+  unchanged, tether 32). ruff and shellcheck clean.
+- **Real run** (`overnight/run/cp/real.sh`, live `tether serve` on
+  127.0.0.1:18111, CLI as separate processes, real upstreams): session cap
+  CONNECT pypi.org 200; npm cap registry.npmjs.org 200, pypi.org refused
+  (DENY "not in capability cap_574e1148db77's egress grant"); session cap
+  GET `/github/metcalfc/tether-scratch.git/info/refs` 200, claude cap
+  (`--route anthropic`) 403; claude cap with `--spend 0.00001`: haiku message
+  1 200 ($0.000033), message 2 403 "sub-cap reached", session cap message
+  200. Mint `--egress '*.org'` and `--spend 3` (session cap $2) refused.
+- Spend this run: 2 haiku calls via tether (max_tokens 5), **$0.000066**
+  (from `state/spend.json` of the real run).
+- No VM booted.
+
 ## 5. Identity in the guest
 
 - [ ] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
@@ -412,6 +460,7 @@ Run 9 (2026-10-18) notes:
 | --- | --- | --- |
 | 4 | 2 (haiku, via leash) | $0.0407 |
 | 5 | 44 via leash + 22 direct (haiku, bench) | $0.0057 via leash; direct est. < $0.005 |
+| 10 | 2 (haiku, via tether, max_tokens 5) | $0.000066 |
 
 ## Decisions and corrections
 

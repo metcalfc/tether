@@ -347,6 +347,7 @@ class TwoSandboxes(unittest.TestCase):
             },
             "egress": {"allow": ["localhost"], "ports": [self.echo_port]},
         }
+        self.configure(cfg, up)
         os.environ["T_ANTHROPIC"] = REAL_KEY
         p = Path(self.tmp.name) / "policy.json"
         p.write_text(json.dumps(cfg))
@@ -356,6 +357,9 @@ class TwoSandboxes(unittest.TestCase):
             threading.Thread(target=s.serve_forever, daemon=True).start()
         self.ports = {n: s.server_address[1] for n, s in self.srvs.items()}
         self.caps = tether.init_caps(self.policy, self.gw.caps)
+
+    def configure(self, cfg: dict[str, Any], up: str) -> None:
+        """Subclasses widen the fixture's policy here."""
 
     def tearDown(self) -> None:
         for s in self.srvs.values():
@@ -374,10 +378,10 @@ class TwoSandboxes(unittest.TestCase):
         c.close()
         return r.status
 
-    def connect(self, sandbox: str, cap: str) -> bytes:
+    def connect(self, sandbox: str, cap: str, host: str = "localhost") -> bytes:
         s = socket.create_connection(("127.0.0.1", self.ports[sandbox]))
         auth = base64.b64encode(f"agent:{cap}".encode()).decode()
-        s.sendall(f"CONNECT localhost:{self.echo_port} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
+        s.sendall(f"CONNECT {host}:{self.echo_port} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
         head = s.recv(4096)
         s.close()
         return head.split(b"\r\n")[0]
@@ -534,6 +538,94 @@ class RegistryTest(TwoSandboxes):
         self.cli("cap", "revoke", "--session", "o1")
         self.assertIn("o1", tether.init_caps(self.policy, self.gw.caps))
         self.assertEqual(self.post("other", tether.env_file_cap(env)), 200)
+
+
+class CapPolicyTest(TwoSandboxes):
+    """A cap's routes, egress and spend narrow the ceiling; they never widen it."""
+
+    CEILING = ["localhost", "registry.npmjs.org", "pypi.org", "*.pythonhosted.org"]
+
+    def configure(self, cfg: dict[str, Any], up: str) -> None:
+        cfg["routes"]["github"] = {
+            "upstream": up,
+            "credential": "env:T_GH",
+            "inject": "basic:x-access-token",
+            "paths": ["/*/info/refs"],
+        }
+        cfg["egress"]["allow"] = self.CEILING
+        cfg["spend"] = {"per_session_usd_per_day": 5.0}
+        os.environ["T_GH"] = GH_TOKEN
+
+    def get(self, sandbox: str, cap: str, path: str) -> int:
+        c = http.client.HTTPConnection("127.0.0.1", self.ports[sandbox])
+        c.request("GET", path, headers={"Authorization": "Bearer " + cap})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def test_route_not_granted_to_the_cap(self) -> None:
+        cap = self.cli("cap", "mint", "--session", "o1", "--agent", "claude", "--route", "anthropic").strip()
+        self.assertEqual(self.post("other", cap), 200)
+        n = len(FakeUpstream.seen)
+        self.assertEqual(self.get("other", cap, "/github/x/info/refs"), 403)
+        self.assertEqual(len(FakeUpstream.seen), n, "an ungranted route must not reach the upstream")
+        rec = self.audit()[-1]
+        self.assertEqual((rec["decision"], rec["route"]), ("deny", "github"))
+        self.assertIn(f"route github not granted to capability {rec['cap_id']}", rec["reason"])
+        # the session's own cap has no narrowing: every route the ceiling has
+        self.assertEqual(self.get("other", self.caps["o1"], "/github/x/info/refs"), 200)
+
+    def test_cap_egress_narrower_than_the_ceiling(self) -> None:
+        npm = self.cli("cap", "mint", "--session", "o1", "--tool", "npm", "--egress", "registry.npmjs.org").strip()
+        rec = self.gw.caps.lookup(npm)
+        # the ceiling allows pypi.org; the npm cap does not
+        self.assertEqual(self.gw.egress_ok("pypi.org", self.echo_port), (True, ""))
+        ok, why = self.gw.egress_ok("pypi.org", self.echo_port, rec)
+        self.assertFalse(ok)
+        self.assertIn("egress grant", why)
+        self.assertTrue(self.gw.egress_ok("registry.npmjs.org", self.echo_port, rec)[0])
+        # over the wire: refused before any connect, on a host the ceiling allows
+        self.assertIn(b"403", self.connect("other", npm, "pypi.org"))
+        self.assertIn(f"not in capability {rec['cap_id']}'s egress grant", self.audit()[-1]["reason"])
+        self.assertIn(b"403", self.connect("other", npm))  # localhost: in the ceiling, not in the grant
+        local = self.cli("cap", "mint", "--session", "o1", "--egress", "localhost").strip()
+        self.assertIn(b"200", self.connect("other", local))
+        # a grant can't widen the ceiling either: serve checks both layers
+        wide = {**rec, "egress": ["*"]}
+        self.assertFalse(self.gw.egress_ok("example.com", self.echo_port, wide)[0])
+
+    def test_spend_sub_cap_refuses_while_the_session_has_budget(self) -> None:
+        cap = self.cli("cap", "mint", "--session", "o1", "--spend", "0.5").strip()
+        cid = self.gw.caps.lookup(cap)["cap_id"]
+        self.assertEqual(self.post("other", cap), 200)  # $1.00 at the default price
+        n = len(FakeUpstream.seen)
+        self.assertEqual(self.post("other", cap), 403)
+        self.assertEqual(len(FakeUpstream.seen), n)
+        self.assertIn(f"sub-cap reached for capability {cid}", self.audit()[-1]["reason"])
+        self.assertEqual(self.post("other", self.caps["o1"]), 200, "the session still has $4 left")
+        led = json.loads((self.policy.state_dir / "spend.json").read_text())
+        self.assertEqual(led["caps"], {cid: 1.0})
+        self.assertEqual(led["spent"], {"o1": 2.0}, "a sub-capped call counts once toward the session")
+
+    def test_mint_must_fit_inside_the_ceiling(self) -> None:
+        for bad in (
+            ["--egress", "*"],
+            ["--egress", "*.npmjs.org"],  # the ceiling has only registry.npmjs.org
+            ["--egress", "example.com"],
+            ["--egress", "?ypi.org"],
+            ["--route", "openai"],
+            ["--spend", "6"],  # above the $5 session cap
+        ):
+            with self.subTest(bad=bad), self.assertRaises(SystemExit):
+                self.cli("cap", "mint", "--session", "o1", *bad)
+        for good in (["--egress", "files.pythonhosted.org"], ["--egress", "*.pythonhosted.org"], ["--spend", "5"]):
+            with self.subTest(good=good):
+                self.assertTrue(self.cli("cap", "mint", "--session", "o1", *good).startswith("tth_"))
+        self.assertTrue(tether.pattern_within("a.b.example.com", "*.example.com"))
+        self.assertTrue(tether.pattern_within("*.a.example.com", "*.example.com"))
+        self.assertFalse(tether.pattern_within("*.com", "*.example.com"))
+        self.assertFalse(tether.pattern_within("*.com", "?.com"), "a ? in the ceiling matches one char, not a *")
 
 
 if __name__ == "__main__":

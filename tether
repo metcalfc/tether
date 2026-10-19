@@ -237,6 +237,38 @@ def parse_ttl(s: str) -> float:
     return float(s[:-1]) * units[s[-1]]
 
 
+def pattern_within(pat: str, ceiling: str) -> bool:
+    """Does every host `pat` matches also match `ceiling`? Exact for a literal
+    host. A `*` in `pat` must be covered by a `*` in the ceiling, which only
+    holds when the ceiling has no `?` or `[...]` (a `?` would let one `*` in).
+    """
+    if pat == ceiling:
+        return True
+    if "*" in pat and ("?" in ceiling or "[" in ceiling):
+        return False
+    return fnmatch.fnmatchcase(pat, ceiling)
+
+
+def grant_errors(
+    policy: Policy, routes: list[str] | None, egress: list[str] | None, spend_usd: float | None
+) -> list[str]:
+    """Why a cap's grants don't fit inside the ceiling (empty if they do).
+    Serve enforces both layers anyway; this refuses a cap that promises more
+    than it can ever get."""
+    errs = [f"no such route: {r}" for r in routes or [] if r not in policy.routes]
+    for pat in egress or []:
+        if any(c in pat for c in "?[]"):
+            errs.append(f"egress {pat}: use literal hosts or * only")
+        elif not any(pattern_within(pat, c) for c in policy.egress_allow):
+            errs.append(f"egress {pat} is wider than the ceiling ({' '.join(policy.egress_allow) or 'nothing'})")
+    if spend_usd is not None:
+        if spend_usd < 0:
+            errs.append("spend sub-cap must not be negative")
+        elif policy.cap_session is not None and spend_usd > policy.cap_session:
+            errs.append(f"spend sub-cap ${spend_usd:.2f} is above the session cap ${policy.cap_session:.2f}")
+    return errs
+
+
 class Registry:
     """Every capability tether has minted: which sandbox it is bound to, who
     holds it (session / agent / tool / human) and what it may do. Kept in
@@ -422,34 +454,45 @@ def init_caps(
 
 
 class Ledger:
-    """Today's spend per session. Persisted so a restart doesn't reset a cap."""
+    """Today's spend per session, and per cap for caps with a sub-cap.
+    Persisted so a restart doesn't reset a cap."""
 
     def __init__(self, path: Path) -> None:
         self.path = path
         self.lock = threading.Lock()
         self.day = today()
         self.spent: dict[str, float] = {}
+        # Kept apart from `spent`, so the team total doesn't count a call twice.
+        self.cap_spent: dict[str, float] = {}
         if path.exists():
             d = json.loads(path.read_text())
             if d.get("day") == self.day:
                 self.spent = d.get("spent", {})
+                self.cap_spent = d.get("caps", {})
 
     def _roll(self) -> None:
         if self.day != today():
-            self.day, self.spent = today(), {}
+            self.day, self.spent, self.cap_spent = today(), {}, {}
 
     def totals(self, session: str) -> tuple[float, float]:
         with self.lock:
             self._roll()
             return self.spent.get(session, 0.0), sum(self.spent.values())
 
-    def add(self, session: str, usd: float) -> None:
+    def cap_total(self, cap_id: str) -> float:
+        with self.lock:
+            self._roll()
+            return self.cap_spent.get(cap_id, 0.0)
+
+    def add(self, session: str, usd: float, cap_id: str | None = None) -> None:
         if usd <= 0:
             return
         with self.lock:
             self._roll()
             self.spent[session] = self.spent.get(session, 0.0) + usd
-            self.path.write_text(json.dumps({"day": self.day, "spent": self.spent}))
+            if cap_id:
+                self.cap_spent[cap_id] = self.cap_spent.get(cap_id, 0.0) + usd
+            self.path.write_text(json.dumps({"day": self.day, "spent": self.spent, "caps": self.cap_spent}))
 
 
 class Audit:
@@ -622,21 +665,38 @@ class Gateway:
             return rec, None
         return None, None
 
-    def egress_ok(self, host: str, port: int) -> tuple[bool, str]:
+    def egress_ok(self, host: str, port: int, cap: dict[str, Any] | None = None) -> tuple[bool, str]:
+        """The ceiling (policy allowlist) first, then the cap's own grant: a
+        host must pass both."""
         if port not in self.p.egress_ports:
             return False, f"port {port} is not allowed"
         if host in self.cred_hosts:
             return False, f"credentialed host; use the gateway route /{self.cred_hosts[host]}/"
-        if any(fnmatch.fnmatchcase(host, pat) for pat in self.p.egress_allow):
-            return True, ""
-        return False, "host is not on the egress allowlist"
+        if not any(fnmatch.fnmatchcase(host, pat) for pat in self.p.egress_allow):
+            return False, "host is not on the egress allowlist"
+        grant = cap.get("egress") if cap else None
+        if grant is not None and not any(fnmatch.fnmatchcase(host, pat) for pat in grant):
+            return False, f"host is not in capability {cap['cap_id']}'s egress grant"
+        return True, ""
 
-    def cap_check(self, session: str) -> str | None:
+    def route_ok(self, cap: dict[str, Any], route: str) -> str | None:
+        grant = cap.get("routes")
+        if grant is not None and route not in grant:
+            return f"route {route} not granted to capability {cap['cap_id']}"
+        return None
+
+    def cap_check(self, cap: dict[str, Any]) -> str | None:
+        session = cap["session"]
         mine, total = self.ledger.totals(session)
         if self.p.cap_session is not None and mine >= self.p.cap_session:
             return f"daily spend cap reached for session {session} (${mine:.2f} of ${self.p.cap_session:.2f})"
         if self.p.cap_total is not None and total >= self.p.cap_total:
             return f"daily spend cap reached for the team (${total:.2f} of ${self.p.cap_total:.2f})"
+        sub = cap.get("spend_usd")
+        if sub is not None:
+            used = self.ledger.cap_total(cap["cap_id"])
+            if used >= sub:
+                return f"daily spend sub-cap reached for capability {cap['cap_id']} (${used:.4f} of ${sub:.4f})"
         return None
 
 
@@ -706,7 +766,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 gw.audit.write(decision="deny", reason=refusal[0], **rec)
                 self._error(403, "permission_error", refusal[1])
                 return
-            ok, why = gw.egress_ok(host, port)
+            ok, why = gw.egress_ok(host, port, cap)
             if not ok:
                 gw.audit.write(decision="deny", reason=why, **rec)
                 self._error(403, "permission_error", f"{host}:{port} refused: {why}")
@@ -791,9 +851,14 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 extra = {"WWW-Authenticate": 'Basic realm="tether"'} if route.inject.startswith("basic:") else None
                 self._error(401, "authentication_error", "bad or missing session capability", extra)
                 return
+            not_granted = gw.route_ok(cap, name)
+            if not_granted:
+                gw.audit.write(decision="deny", reason=not_granted, **rec)
+                self._error(403, "permission_error", f"route /{name}/ is not granted to this capability")
+                return
             session = cap["session"]
             if route.meter:
-                blocked = gw.cap_check(session)
+                blocked = gw.cap_check(cap)
                 if blocked:
                     gw.audit.write(decision="deny", reason=blocked, **rec)
                     # 403, not 429: a 429 is an invitation to retry.
@@ -855,7 +920,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 if meter:
                     meter.finish()
                     usd = round(cost_usd(gw.p.prices, meter.model, meter.usage), 6)
-                    gw.ledger.add(session, usd)
+                    gw.ledger.add(session, usd, cap["cap_id"] if cap.get("spend_usd") is not None else None)
                     rec.update(model=meter.model or None, tokens=meter.usage or None)
                 gw.audit.write(
                     decision="allow",
@@ -944,9 +1009,10 @@ def cmd_cap(policy: Policy, args: argparse.Namespace) -> None:
             raise SystemExit(f"tether: no sandbox {sandbox!r} (session {args.session!r} is in none)")
         if args.session not in policy.sandboxes[sandbox].sessions:
             raise SystemExit(f"tether: session {args.session!r} is not in sandbox {sandbox!r}")
-        unknown = [r for r in args.route or [] if r not in policy.routes]
-        if unknown:
-            raise SystemExit(f"tether: no such route(s): {', '.join(unknown)}")
+        egress = [h.lower() for h in args.egress] if args.egress else None
+        errs = grant_errors(policy, args.route, egress, args.spend)
+        if errs:
+            raise SystemExit("tether: cap must fit inside the ceiling: " + "; ".join(errs))
         cap, rec = reg.mint(
             sandbox,
             args.session,
@@ -954,7 +1020,7 @@ def cmd_cap(policy: Policy, args: argparse.Namespace) -> None:
             tool=args.tool,
             human=args.human,
             routes=args.route,
-            egress=[h.lower() for h in args.egress] if args.egress else None,
+            egress=egress,
             spend_usd=args.spend,
             ttl_secs=parse_ttl(args.ttl) if args.ttl else None,
         )
