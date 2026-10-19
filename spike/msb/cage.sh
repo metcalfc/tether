@@ -29,6 +29,10 @@
 #                      (nono.sh check); run `users` first; needs CAGE_OUT
 #   cage.sh proc       /proc and ptrace routes to another tool's or agent's
 #                      cap (guest/nono.sh proc); run `nono` first
+#   cage.sh adv CASE   milestone 7's adversarial cases (guest/adv.sh CASE as
+#                      guest root), then check tether's audit lines from
+#                      this run (advcheck.py); run `users` and `nono` first.
+#                      CASE: readme
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -245,6 +249,18 @@ cmd_proc() {
   limit 300 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" proc
 }
 
+cmd_adv() {
+  need_out
+  [[ $# -eq 1 ]] || die "usage: cage.sh adv CASE"
+  local audit from rc=0
+  audit="$(state_dir)/audit.jsonl"
+  from=$(wc -l <"$audit" | tr -d ' ')
+  limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" \
+    CAGE_MODEL="${CAGE_MODEL:-claude-haiku-4-5}" ADV_MODEL_RUN="${ADV_MODEL_RUN:-1}" "$GUEST_DIR/adv.sh" "$1" || rc=$?
+  [[ $rc == 0 ]] || log "adv.sh $1 exited $rc"
+  python3 "$HERE/advcheck.py" "$audit" "$from" "$1"
+}
+
 cmd_down() {
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
@@ -262,5 +278,6 @@ cmd_status() {
 case "${1:-}" in
   compile | gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,42p' "$0"; exit 2 ;;
+  adv) shift; cmd_adv "$@" ;;
+  *) sed -n '2,46p' "$0"; exit 2 ;;
 esac
