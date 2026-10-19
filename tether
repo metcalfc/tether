@@ -1928,11 +1928,26 @@ def nono_profile(
                 "can_use": ["git-remote-http"],
                 "export_env": ["GIT_*"],
                 "sandbox": box,
+                # A push: git-remote-http runs `git send-pack`, which inherits
+                # the -c include.path above, so it reads the same cap file. It
+                # gets no network of its own; it talks to the helper on pipes.
+                "from": {
+                    "git-remote-http": {
+                        "sandbox": {
+                            "fs_read": box["fs_read"],
+                            "fs_write": box["fs_write"],
+                            "use_credentials": [f"{t}-cap"],
+                            "allow_raw_file_credentials_in_chained_policy": True,
+                            "environment": box["environment"],
+                        }
+                    }
+                },
             }
             # The rewrite points at the plain-HTTP gateway, so git's helper is
             # git-remote-http, run as a second command with the same file.
             commands["git-remote-http"] = {
                 "executable": "/usr/lib/git-core/git-remote-http",
+                "can_use": ["git"],
                 "from": {
                     "session": "deny",
                     "git": {

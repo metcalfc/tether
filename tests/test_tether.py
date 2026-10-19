@@ -1755,6 +1755,20 @@ class CompileTest(unittest.TestCase):
         creds = prof["command_policies"]["credentials"]
         self.assertEqual(creds["npm-cap"], {"type": "raw-file", "path": "/run/tether/claude/npm"})
 
+    def test_git_push_edge(self) -> None:
+        # git push: git -> git-remote-http -> git send-pack. Without the second
+        # edge nono refuses send-pack and every push fails (run 28).
+        out, lints = self.compile()
+        self.assertEqual(lints.errors, [])
+        cmds = out["nono"]["claude"]["command_policies"]["commands"]
+        self.assertEqual(cmds["git"]["can_use"], ["git-remote-http"])
+        self.assertEqual(cmds["git-remote-http"]["can_use"], ["git"])
+        edge = cmds["git"]["from"]["git-remote-http"]["sandbox"]
+        self.assertEqual(edge["use_credentials"], ["git-cap"])
+        self.assertNotIn("network", edge)
+        self.assertNotIn("session", cmds["git"]["from"])
+        self.assertIn("GIT_CONFIG_PARAMETERS", edge["environment"]["allow_vars"])
+
     def test_npm_scripts_edge(self) -> None:
         # Off by default: no sh edge, so npm's `sh -c` hits nono's exec gate.
         for a in ("claude", "codex"):
