@@ -938,6 +938,20 @@ def buffered_bytes(rfile: Any, sock: socket.socket) -> bytes:
         sock.settimeout(old)
 
 
+_TLS: ssl.SSLContext | None = None
+_TLS_LOCK = threading.Lock()
+
+
+def tls_context() -> ssl.SSLContext:
+    """One verifying client context for every upstream. Building one loads the
+    CA store, ~2.5 ms per request on macOS; a shared context is thread-safe."""
+    global _TLS
+    with _TLS_LOCK:
+        if _TLS is None:
+            _TLS = ssl.create_default_context()
+        return _TLS
+
+
 def addr_refusal(addr: str, allowed: list[ipaddress.IPv4Network | ipaddress.IPv6Network]) -> str | None:
     """Why a tunnel may not go to `addr`, or None. Only global unicast
     addresses pass, unless the policy allowlists the address: a gateway on the
@@ -1516,8 +1530,13 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 fwd["transfer-encoding"] = "chunked"
             elif body.length:
                 fwd["content-length"] = str(body.length)
-            conn_cls = http.client.HTTPSConnection if route.upstream.scheme == "https" else http.client.HTTPConnection
-            conn = conn_cls(route.upstream.hostname or "", route.upstream.port, timeout=600)
+            conn: http.client.HTTPConnection
+            if route.upstream.scheme == "https":
+                conn = http.client.HTTPSConnection(
+                    route.upstream.hostname or "", route.upstream.port, timeout=600, context=tls_context()
+                )
+            else:
+                conn = http.client.HTTPConnection(route.upstream.hostname or "", route.upstream.port, timeout=600)
             try:
                 conn.request(self.command, target, body=body.upload(), headers=fwd, encode_chunked=body.chunked)
                 resp = conn.getresponse()
@@ -1609,7 +1628,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             try:
                 up = socket.create_connection((host, port), timeout=UPGRADE_CONNECT_SECS)
                 if tls:
-                    up = ssl.create_default_context().wrap_socket(up, server_hostname=host)
+                    up = tls_context().wrap_socket(up, server_hostname=host)
             except OSError as e:
                 self._audit(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
                 self._error(502, "api_error", "upstream error")

@@ -388,6 +388,30 @@ class TetherTest(unittest.TestCase):
         self.assertNotIn("authorization", h)
         self.assertEqual(FakeUpstream.seen[-1]["path"], "/v1/messages")
 
+    def test_https_upstreams_share_one_verifying_tls_context(self) -> None:
+        ctx = tether.tls_context()
+        self.assertIs(ctx, tether.tls_context())
+        self.assertEqual((ctx.verify_mode, ctx.check_hostname), (ssl.CERT_REQUIRED, True))
+        seen: list[Any] = []
+        up_port = self.up.server_address[1]
+
+        class Recording(http.client.HTTPConnection):  # plain HTTP to the fake, records the context it was given
+            def __init__(self, host: str, port: int | None = None, *, timeout: float = 10, context: Any = None) -> None:
+                seen.append((host, context))
+                super().__init__("127.0.0.1", up_port, timeout=timeout)
+
+        self.gw.p.routes["anthropic"].upstream = urllib.parse.urlsplit("https://api.example.test")
+        orig = http.client.HTTPSConnection
+        http.client.HTTPSConnection = Recording  # type: ignore[misc]
+        try:
+            auth = {"Authorization": "Bearer " + self.caps["alice"]}
+            for _ in range(2):
+                st, _ = self.post("/anthropic/v1/messages/count_tokens", {}, auth)
+                self.assertEqual(st, 200)
+        finally:
+            http.client.HTTPSConnection = orig  # type: ignore[misc]
+        self.assertEqual(seen, [("api.example.test", ctx), ("api.example.test", ctx)])
+
     def test_oauth_token_gets_bearer_and_beta(self) -> None:
         self.gw.p.routes["anthropic"].credential = "sk-ant-oat01-MAX"
         self.post("/anthropic/v1/messages", {}, {"x-api-key": self.caps["alice"], "anthropic-beta": "foo"})
