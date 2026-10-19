@@ -8,6 +8,8 @@
 # every guest query gets NXDOMAIN. Enforcement lives in the msb process on
 # the host, so root in the guest has nothing to flush.
 #
+#   cage.sh compile    tether compile CAGE_SOURCE -o CAGE_OUT (msb flags,
+#                      nono profiles, tether config, all from one file)
 #   cage.sh gw-up      start the gateway on 127.0.0.1:18001 (pidfile, log)
 #   cage.sh gw-down    stop it
 #   cage.sh up         mint caps, boot the locked sandbox, push env + scripts
@@ -19,10 +21,12 @@
 #   cage.sh works      run guest/works.sh
 #   cage.sh users      per-agent users and a shared /work (guest/users.sh
 #                      setup), then prove it (users.sh check)
-#   cage.sh caps       mint one cap per agent and per (agent, tool) and pipe
-#                      each into the guest's /run/tether (never on host disk)
-#   cage.sh nono       nono profiles + launchers (guest/nono.sh setup), caps,
-#                      then prove them (nono.sh check); run `users` first
+#   cage.sh caps       mint one cap per agent and per (agent, tool), with the
+#                      compiled grants, and pipe each into the guest's
+#                      /run/tether (never on host disk); needs CAGE_OUT
+#   cage.sh nono       install the compiled nono profiles + launchers
+#                      (guest/nono.sh setup), caps, then prove them
+#                      (nono.sh check); run `users` first; needs CAGE_OUT
 #   cage.sh proc       /proc and ptrace routes to another tool's or agent's
 #                      cap (guest/nono.sh proc); run `nono` first
 #   cage.sh down       stop and remove the sandbox, stop the gateway
@@ -32,11 +36,24 @@
 # CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001),
 # CAGE_MODEL (claude-haiku-4-5, for works), CAGE_AGENTS ("claude codex"),
 # CAGE_NONO_DIR (~/.microsandbox/tether-guest/bin, mounted at /opt/nono).
+# With CAGE_OUT (a `tether compile` output directory) the machine name, port,
+# agents, msb flags, tether policy and every grant come from there instead,
+# and CAGE_GW defaults to ./tether. CAGE_SOURCE is the policy `compile` reads
+# (spike/msb/poc-policy.json).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 MSB=${MSB:-$HOME/.microsandbox/bin/msb}
+OUT=${CAGE_OUT:-}
+SOURCE=${CAGE_SOURCE:-$HERE/poc-policy.json}
+if [[ -n $OUT && -f $OUT/machine.env ]]; then
+  # shellcheck source=/dev/null # written by tether compile
+  . "$OUT/machine.env"
+  CAGE_GW=${CAGE_GW:-$REPO/tether}
+  CAGE_POLICY=$OUT/tether.json
+fi
+SESSION=${CAGE_SESSION:-cage}
 NAME=${CAGE_NAME:-tether-cage}
 IMAGE=${CAGE_IMAGE:-node:22-bookworm}
 GW=${CAGE_GW:-$REPO/leash}
@@ -52,6 +69,12 @@ NONO_DIR=${CAGE_NONO_DIR:-$HOME/.microsandbox/tether-guest/bin}
 
 log() { printf '[cage] %s\n' "$*" >&2; }
 die() { log "$*"; exit 1; }
+need_out() { [[ -n $OUT && -f $OUT/machine.env ]] || die "set CAGE_OUT to a tether compile output (cage.sh compile)"; }
+
+cmd_compile() {
+  [[ -n $OUT ]] || die "set CAGE_OUT (e.g. overnight/run/compiled)"
+  "$REPO/tether" compile "$SOURCE" -o "$OUT"
+}
 
 # perl alarm stands in for GNU timeout, which macOS does not have.
 limit() { perl -e 'alarm shift; exec @ARGV' "$@"; }
@@ -87,16 +110,20 @@ cmd_up() {
   sandbox_exists && die "sandbox $NAME exists; cage.sh down first"
   "$GW" -c "$POLICY" init
   local env
-  env="$(state_dir)/cage.env"
+  env="$(state_dir)/$SESSION.env"
   [[ -f $env ]] || die "no $env after init"
-  log "booting $NAME from $IMAGE: --net-default deny --net-rule allow@host:tcp:$PORT"
-  local t0 t1
+  local args=() l t0 t1
+  if [[ -n $OUT ]]; then
+    need_out
+    while IFS= read -r l; do args+=("$l"); done <"$OUT/msb.args"
+  else
+    args=(create "$IMAGE" --name "$NAME" --cpus 4 --memory 4G
+      --net-default deny --net-rule "allow@host:tcp:$PORT"
+      --tmpfs /run/tether --mount-dir "$NONO_DIR:/opt/nono:ro")
+  fi
+  log "booting: msb ${args[*]}"
   t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
-  limit 300 "$MSB" create "$IMAGE" --name "$NAME" -q \
-    --cpus 4 --memory 4G \
-    --net-default deny --net-rule "allow@host:tcp:$PORT" \
-    --tmpfs /run/tether \
-    --mount-dir "$NONO_DIR:/opt/nono:ro"
+  limit 300 "$MSB" "${args[@]}" -q
   limit 60 "$MSB" exec "$NAME" -- true
   t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
   log "boot to first exec: $(perl -e 'printf "%.2f", $ARGV[1]-$ARGV[0]' "$t0" "$t1")s"
@@ -113,7 +140,15 @@ push_files() {
     limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$f")"
     limit 30 "$MSB" exec "$NAME" -- chmod +x "$GUEST_DIR/$(basename "$f")"
   done
-  log "pushed $GUEST_ENV and $GUEST_DIR/*.{sh,py}"
+  if [[ -n $OUT ]]; then
+    # The compiled nono profiles and Claude settings; nono.sh setup installs them.
+    limit 30 "$MSB" exec "$NAME" -- mkdir -p "$GUEST_DIR/nono" "$GUEST_DIR/settings"
+    for f in "$OUT"/nono/*.json "$OUT"/settings/*.json; do
+      [[ -f $f ]] || continue
+      limit 60 "$MSB" copy "$f" "$NAME:$GUEST_DIR/$(basename "$(dirname "$f")")/$(basename "$f")"
+    done
+  fi
+  log "pushed $GUEST_ENV and $GUEST_DIR/*.{sh,py}${OUT:+, nono/ and settings/ from $OUT}"
 }
 
 cmd_exec() {
@@ -146,7 +181,7 @@ cmd_check() {
   return "$fails"
 }
 
-cmd_push() { push_files "$(state_dir)/cage.env"; }
+cmd_push() { push_files "$(state_dir)/$SESSION.env"; }
 
 cmd_attack() {
   local ctl=$((PORT + 1)) lan pid rc=0
@@ -174,53 +209,32 @@ cmd_works() {
     "set -a; . $GUEST_ENV; set +a; export ANTHROPIC_MODEL=${CAGE_MODEL:-claude-haiku-4-5}; $GUEST_DIR/works.sh"
 }
 
-cmd_users() {
-  limit 120 "$MSB" exec "$NAME" --no-stdin -- "$GUEST_DIR/users.sh" setup
-  limit 120 "$MSB" exec "$NAME" --no-stdin -- "$GUEST_DIR/users.sh" check
-}
-
-# Grants per agent and per tool. The agent's own cap rides in its session's
-# environment; a tool's cap is a file only that tool's command sandbox reads.
 CAGE_AGENTS=${CAGE_AGENTS:-claude codex}
-agent_grants() {
-  case $1 in
-    claude) echo "--route anthropic --egress pypi.org --egress files.pythonhosted.org" ;;
-    *) echo "--no-route --egress pypi.org" ;;
-  esac
-}
-tool_grants() {
-  case $1 in
-    git) echo "--route github --no-egress" ;;
-    npm) echo "--no-route --egress registry.npmjs.org" ;;
-  esac
+HUMANS=${CAGE_HUMANS:-dev}
+HUMAN=${HUMANS%% *}
+
+cmd_users() {
+  limit 120 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" HUMAN="${HUMAN:-dev}" "$GUEST_DIR/users.sh" setup
+  limit 120 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" HUMAN="${HUMAN:-dev}" "$GUEST_DIR/users.sh" check
 }
 
-put_cap() { # put_cap AGENT NAME GRANTS...: mint, and pipe the env file straight into the guest
-  local a=$1 name=$2; shift 2
-  local tool=() fmt=env
-  case $name in
-    agent) ;;
-    git) tool=(--tool git); fmt=gitconfig ;;  # read by git -c include.path
-    npm) tool=(--tool npm); fmt=npmrc ;;      # read by npm --userconfig
-    *) tool=(--tool "$name") ;;
-  esac
-  "$GW" -c "$POLICY" cap mint --session cage --agent "$a" "${tool[@]}" --ttl 12h "$@" --format "$fmt" --env - |
-    limit 60 "$MSB" exec "$NAME" -- "$GUEST_DIR/nono.sh" put "$a" "$name"
-}
-
+# One cap per line of the compiled caps.list ("AGENT agent" or "AGENT TOOL"),
+# minted with the grants tether compile wrote for it. The agent's own cap rides
+# in its session's environment; a tool's cap is a file in the tool's own format
+# (gitconfig, npmrc) that only that tool's command sandbox can read.
 cmd_caps() {
-  local a t
-  for a in $CAGE_AGENTS; do
-    # shellcheck disable=SC2046 # grants are flag lists
-    put_cap "$a" agent $(agent_grants "$a")
-    for t in git npm; do
-      # shellcheck disable=SC2046
-      put_cap "$a" "$t" $(tool_grants "$t")
-    done
-  done
+  need_out
+  local a t grant
+  while read -r a t; do
+    grant=$a
+    [[ $t == agent ]] || grant=$a/$t
+    "$GW" -c "$POLICY" cap mint --session "$SESSION" --grant "$grant" --ttl 12h --env - |
+      limit 60 "$MSB" exec "$NAME" -- "$GUEST_DIR/nono.sh" put "$a" "$t"
+  done <"$OUT/caps.list"
 }
 
 cmd_nono() {
+  need_out
   limit 120 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" setup
   cmd_caps
   limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" "$GUEST_DIR/nono.sh" check
@@ -246,7 +260,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
+  compile | gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,34p' "$0"; exit 2 ;;
+  *) sed -n '2,42p' "$0"; exit 2 ;;
 esac

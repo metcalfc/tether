@@ -25,6 +25,7 @@ import tracemalloc
 import types
 import unittest
 import urllib.parse
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -1446,3 +1447,194 @@ class ReservationTest(TwoSandboxes):
         led.settle(r, 0.1)
         led.settle(r, 0.1)
         self.assertEqual((led.spent["o1"], led.held["o1"], led.inflight["o1"]), (0.1, 0.0, 0))
+
+
+class CompileTest(unittest.TestCase):
+    """tether compile: one rl/poc-1 file -> msb flags, nono profiles, tether config."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self.tmp.name)
+        src = json.loads((HERE / "spike/msb/poc-policy.json").read_text())
+        # Never touch the keychain from a test; the compiler only names credentials anyway.
+        src["gateway"]["credentials"] = {"anthropic": "env:T_ANTHROPIC", "github": "env:T_GH"}
+        src["state_dir"] = "state"
+        self.src = src
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def compile(self, cfg: dict[str, Any] | None = None) -> tuple[dict[str, Any], Any]:
+        p = self.dir / "src.json"
+        p.write_text(json.dumps(cfg if cfg is not None else self.src))
+        return tether.compile_policy(p)
+
+    def errors(self, mutate: Callable[[dict[str, Any]], None]) -> str:
+        cfg = json.loads(json.dumps(self.src))
+        mutate(cfg)
+        _, lints = self.compile(cfg)
+        return "\n".join(lints.errors)
+
+    def test_repo_policy_compiles_clean(self) -> None:
+        out, lints = tether.compile_policy(HERE / "spike/msb/poc-policy.json")
+        self.assertEqual(lints.errors, [])
+        args = out["msb_args"]
+        self.assertEqual(args[:4], ["create", "node:22-bookworm", "--name", "tether-cage"])
+        joined = " ".join(args)
+        self.assertIn("--net-default deny --net-rule allow@host:tcp:18001 --tmpfs /run/tether", joined)
+        self.assertNotIn("--secret", joined)
+        self.assertEqual(out["caps"], [(a, t) for a in ("claude", "codex") for t in ("agent", "git", "npm")])
+        self.assertEqual(out["machine_env"]["CAGE_AGENTS"], "claude codex")
+        # keychain: names become cmd: specs; nothing was resolved
+        cred = out["tether"]["routes"]["anthropic"]["credential"]
+        self.assertEqual(cred, "cmd:security find-generic-password -s tether-anthropic -w")
+        self.assertEqual(out["settings"], {"claude": {"skipWebFetchPreflight": True}})
+
+    def test_nono_profile_shape(self) -> None:
+        out, lints = self.compile()
+        self.assertEqual(lints.errors, [])
+        prof = out["nono"]["claude"]
+        self.assertEqual(prof["network"], {"connect_port": [18001]})
+        self.assertNotIn("/run/tether", json.dumps(prof["filesystem"]))
+        self.assertIn("/home/claude/.npm", prof["filesystem"]["allow"])
+        self.assertEqual(prof["filesystem"]["read"], ["/usr", "/etc", "/opt/nono", "/opt/tether"])
+        cmds = prof["command_policies"]["commands"]
+        git = cmds["git"]["sandbox"]
+        self.assertEqual(git["argv_prepend"][:4], ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"])
+        self.assertIn("include.path=/run/tether/claude/git", git["argv_prepend"])
+        self.assertEqual(cmds["git-remote-http"]["from"]["session"], "deny")
+        self.assertIn("--userconfig", cmds["npm"]["sandbox"]["argv_prepend"])
+        creds = prof["command_policies"]["credentials"]
+        self.assertEqual(creds["npm-cap"], {"type": "raw-file", "path": "/run/tether/claude/npm"})
+
+    def test_compiled_config_loads_and_mints_by_grant(self) -> None:
+        os.environ["T_ANTHROPIC"] = REAL_KEY
+        os.environ["T_GH"] = GH_TOKEN
+        out, lints = self.compile()
+        self.assertEqual(lints.errors, [])
+        files = tether.write_compiled(out, self.dir / "out")
+        self.assertIn(self.dir / "out/nono/codex.json", files)
+        cfg = self.dir / "out/tether.json"
+        pol = tether.Policy(cfg)
+        self.assertEqual(list(pol.sandboxes), ["tether-cage"])
+        self.assertEqual(pol.sandboxes["tether-cage"].listen, "127.0.0.1:18001")
+        self.assertEqual(pol.cap_session, 2.0)
+        self.assertNotIn(REAL_KEY, cfg.read_text())
+
+        def cli(*a: str) -> str:
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                tether.main(["-c", str(cfg), *a])
+            return buf.getvalue()
+
+        git = cli("cap", "mint", "--session", "cage", "--grant", "claude/git", "--env", "-")
+        self.assertIn("extraHeader = Authorization: Basic", git)
+        npm = cli("cap", "mint", "--session", "cage", "--grant", "codex/npm", "--env", "-")
+        self.assertIn("https-proxy=http://agent:tth_", npm)
+        env = cli("cap", "mint", "--session", "cage", "--grant", "codex", "--env", "-")
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertIn("HTTPS_PROXY", env)
+        recs = {(r["agent"], r["tool"]): r for r in json.loads(cli("cap", "list", "--json"))}
+        self.assertEqual(recs[("claude", "git")]["routes"], ["github"])
+        self.assertEqual(recs[("claude", "git")]["egress"], [])
+        self.assertEqual(recs[("codex", None)]["egress"], ["pypi.org"])
+        for bad in (["--grant", "nobody"], ["--grant", "claude/pip"], ["--grant", "claude", "--route", "github"]):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                cli("cap", "mint", "--session", "cage", *bad)
+
+    def test_subset_checks(self) -> None:
+        def agent_egress(c: dict[str, Any]) -> None:
+            c["agents"]["claude"]["egress"].append("evil.example")
+
+        self.assertIn("agents.claude: egress evil.example is wider than the ceiling", self.errors(agent_egress))
+
+        def tool_route(c: dict[str, Any]) -> None:
+            c["ceiling"]["routes"] = ["anthropic"]
+
+        e = self.errors(tool_route)
+        self.assertIn("agents.claude.tools.git: route github is not in the ceiling", e)
+        self.assertIn("ceiling.routes", self.errors(lambda c: c["ceiling"]["routes"].append("openai")))
+
+        def tool_fs(c: dict[str, Any]) -> None:
+            c["agents"]["codex"]["tools"]["npm"]["fs"]["write"].append("/srv")
+
+        self.assertIn("agents.codex.tools.npm.fs.write: /srv is outside codex's grants", self.errors(tool_fs))
+
+        def tool_home(c: dict[str, Any]) -> None:
+            c["agents"]["codex"]["tools"]["git"]["fs"]["write"].append("~/.ssh")
+
+        self.assertIn("/home/codex/.ssh is outside codex's grants", self.errors(tool_home))
+
+        def spend(c: dict[str, Any]) -> None:
+            c["agents"]["claude"]["spend_usd"] = 5
+            c["gateway"]["spend"]["session_usd_per_day"] = 3
+
+        e = self.errors(spend)
+        self.assertIn("above the ceiling's $2.0", e)
+        self.assertIn("agents.claude: spend_usd $5 is above the session cap", e)
+
+    def test_wildcard_and_route_lints(self) -> None:
+        for pat, why in (
+            ("*.s3.amazonaws.com", "amazonaws.com"),
+            ("*.amazonaws.com", "amazonaws.com"),
+            ("*.core.windows.net", "blob.core.windows.net"),
+            ("*.ngrok-free.app", "ngrok-free.app"),
+            ("*.com", "public suffix"),
+            ("*", "literal host"),
+            ("registry.*.org", "literal host"),
+            ("pypi.or?", "literal host"),
+        ):
+            self.assertIn(why, tether.egress_lint(pat) or "", pat)
+        for ok in ("registry.npmjs.org", "*.pythonhosted.org"):
+            self.assertIsNone(tether.egress_lint(ok), ok)
+
+        def wide(c: dict[str, Any]) -> None:
+            c["ceiling"]["egress"].append("*.s3.amazonaws.com")
+            c["agents"]["claude"]["egress"].append("*.s3.amazonaws.com")
+
+        e = self.errors(wide)
+        self.assertIn("ceiling.egress: *.s3.amazonaws.com: wildcard over amazonaws.com", e)
+        self.assertIn("agents.claude: egress *.s3.amazonaws.com", e)
+
+        def route_host(c: dict[str, Any]) -> None:
+            c["ceiling"]["egress"].append("*.anthropic.com")
+
+        self.assertIn("ceiling: egress *.anthropic.com covers api.anthropic.com", self.errors(route_host))
+        self.assertIn("covers github.com", self.errors(lambda c: c["ceiling"]["egress"].append("github.com")))
+
+        def owner_glob(c: dict[str, Any]) -> None:
+            c["gateway"]["routes"]["github"]["paths"] = ["/*/info/refs", "/metcalfc/**"]
+
+        e = self.errors(owner_glob)
+        self.assertIn("path /*/info/refs: the first segment must be literal", e)
+        self.assertIn("path /metcalfc/**: '**'", e)
+        self.assertIn("list its paths", self.errors(lambda c: c["gateway"]["routes"]["github"].pop("paths")))
+
+        def no_cap(c: dict[str, Any]) -> None:
+            del c["gateway"]["spend"]["session_usd_per_day"]
+            del c["ceiling"]["spend"]
+
+        self.assertIn("route anthropic is metered and granted, but there is no session spend cap", self.errors(no_cap))
+
+    def test_shape_and_fs_lints(self) -> None:
+        def deny(c: dict[str, Any]) -> None:
+            c["agents"]["claude"]["tools"]["npm"]["fs"]["deny"] = ["/work/.git"]
+
+        self.assertIn("Landlock has no deny", self.errors(deny))
+        self.assertIn("too wide", self.errors(lambda c: c["agents"]["claude"]["fs"]["write"].append("~")))
+        self.assertIn("~/.config", self.errors(lambda c: c["agents"]["claude"]["fs"]["write"].append("~/.config/gh")))
+        self.assertIn("unknown key 'egres'", self.errors(lambda c: c["agents"]["codex"].update(egres=["x"])))
+        self.assertIn("only 'laptop'", self.errors(lambda c: c.update(placement={"cloud": "gcp"})))
+        self.assertIn("deny_private", self.errors(lambda c: c["gateway"]["egress"].update(deny_private=False)))
+        self.assertIn("knows how to sandbox", self.errors(lambda c: c["agents"]["codex"]["tools"].update(pip={})))
+        no_github = self.errors(lambda c: c["agents"]["codex"]["tools"]["git"].pop("routes"))
+        self.assertIn("a git cap needs the github route", no_github)
+        self.assertIn("schema", self.errors(lambda c: c.update(schema="rl/poc-2")))
+        # a policy with errors writes nothing
+        cfg = json.loads(json.dumps(self.src))
+        cfg["agents"]["claude"]["egress"].append("evil.example")
+        p = self.dir / "bad.json"
+        p.write_text(json.dumps(cfg))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            tether.main(["compile", str(p), "-o", str(self.dir / "never")])
+        self.assertFalse((self.dir / "never").exists())

@@ -555,3 +555,8 @@ Found while building the PoC (Oct 18–19, 2026). The code wins; details are in 
 - **The cap rides in a header, not URL userinfo,** because git passes the rewritten URL to `git-remote-http` as argv, and `/proc/<pid>/cmdline` is readable by every process.
 - **Per-tool caps do not hide a tool's cap from the agent driving that tool:** `git config --get-regexp extraheader` prints it. They keep it from other tools (an npm script cannot read git's cap or run git) and give per-tool attribution in tether's audit.
 - **A session profile cannot grant the whole home directory** (it overlaps nono's state root, `~/.local/state/nono`), nor `~/.config` (it overlaps nono's built-in credential denies). The profile grants `~/.claude`, `~/.cache`, `~/.npm` and `~/.claude.json`.
+- **`tether compile` (milestone 6).**
+  - The policy is JSON (`spike/msb/poc-policy.json`, schema `rl/poc-1`), not YAML, because tether stays stdlib.
+  - "Each tool's grants fit inside its agent's" holds for files only. The design's own example gives `git` the `github` route while `claude` has only `anthropic`, so a tool's routes and egress are checked against the ceiling, not against its agent. That is the point of per-tool caps: the agent's own cap cannot push.
+  - Unknown keys are errors, so a typo cannot quietly widen or drop a grant.
+  - msb gets no `--user dev`: the bootstrap (users, ACLs, caps) runs as guest root over `msb exec`, and agents run under their own UIDs through `setpriv` and nono.

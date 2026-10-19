@@ -6,22 +6,27 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 5 is done (run 18). **Next: milestone 6, item 1: `tether
-compile`.** This starts a new milestone, so re-read `design/tether-poc.md`
-first (the policy model and compiler sections). One policy file should emit
-(a) the msb flags `cage.sh up` passes today (`--net-default deny --net-rule
-allow@host:tcp:P --tmpfs /run/tether ...`), (b) the nono profiles that
-`spike/msb/guest/nono.sh write_profile` builds in python today (move that
-logic into tether, so nono.sh only installs the emitted JSON), and (c)
-tether's own config (sandboxes, routes, egress, per-agent and per-tool cap
-grants that `cage.sh agent_grants`/`tool_grants` hard-code today). Subset
-checks: every cap's routes/egress must be inside the ceiling, every tool's
-grants inside its agent's sandbox; wildcard lints (e.g. `*.github.com` in
-egress, `**` routes). Unit tests in `tests/test_tether.py`, then prove it in
-the cage by booting from compiled output and rerunning `cage.sh nono` and
-`cage.sh proc` (both should stay 19/19 and 11/11).
+Milestone 6 item 1 (`tether compile`) is done (run 19). **Next: milestone 6,
+item 2: `tether report --by tool`.** Group the audit by (session, agent,
+tool) with requests, denials, tokens and USD; the audit lines already carry
+`agent`/`tool`/`cap_id` (run 14/15). Unit-test it, then run it on the real
+`overnight/run/tether-msb/state/audit.jsonl`, which already has `claude git`,
+`claude npm`, `codex git` and `claude -` lines from runs 17-19.
 
-Cage env used in runs 11 and 16 (tether as the gateway, Landlock kernel):
+The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
+port, agents, msb flags, tether policy and every cap grant; without it,
+cage.sh keeps its old leash defaults for `up`/`check`/`attack`/`works`, but
+`caps` and `nono` need it:
+
+```sh
+export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib \
+  CAGE_OUT=$PWD/overnight/run/compiled
+spike/msb/cage.sh compile && spike/msb/cage.sh gw-up && spike/msb/cage.sh up && spike/msb/cage.sh users
+spike/msb/cage.sh nono && spike/msb/cage.sh proc
+# ... and always: spike/msb/cage.sh down
+```
+
+Older cage env (runs 11-18, hand-written policy, before compile):
 
 ```sh
 export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib \
@@ -874,9 +879,75 @@ Run 18 (2026-10-19) notes:
 
 ## 6. Compiler and conformance
 
-- [ ] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
+- [x] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
 - [ ] `tether report --by tool`
 - [ ] Claude Code conformance: betas forwarded, SSE pings, `count_tokens`, error bodies, `HEAD /api/hello`, `skipWebFetchPreflight`
+
+Run 19 (2026-10-19) notes:
+
+- New: `tether compile SRC -o DIR [--check]` (`compile_policy`,
+  `nono_profile`, `write_compiled` in `./tether`), plus
+  `spike/msb/poc-policy.json`, the PoC's one policy (`rl/poc-1` in JSON;
+  credentials are keychain names, `keychain:X` becomes `cmd:security
+  find-generic-password -s X -w`; the compiler never resolves one). Outputs
+  in `DIR`:
+  - `msb.args` (one arg per line);
+  - `machine.env` (CAGE_NAME/PORT/SESSION/AGENTS/HUMANS);
+  - `tether.json` (sandbox `tether-cage` on 127.0.0.1:18001, ceiling routes
+    only, the ceiling's egress, spend, prices, and a `grants` map per agent
+    and per tool);
+  - `caps.list`;
+  - `nono/<agent>.json`;
+  - `settings/<agent>.json` (Claude settings, `skipWebFetchPreflight`).
+- `tether cap mint --grant AGENT[/TOOL]` takes routes, egress, spend and cap
+  format from the compiled `grants`. cage.sh's hard-coded
+  `agent_grants`/`tool_grants` are gone, and so is `nono.sh write_profile`:
+  nono.sh now only installs `/opt/leash/nono/<a>.json`, which `cage.sh push`
+  copies there, and installs Claude settings to `~/.claude/settings.json`
+  (agent-owned, 0600).
+- **The compiled profiles are byte-for-byte equal (as JSON) to the
+  hand-built ones** for both agents. This was checked by running the old
+  `write_profile` python next to the compiler before deleting it.
+- Checks (errors; nothing is written if there are any):
+  - **Subset:** agent and tool routes are in the ceiling, egress is within
+    the ceiling (`pattern_within`), tool fs writes are inside the agent's
+    writes and tool reads inside the agent's reads, writes or `/usr` and
+    `/etc`; spend (agent, tool, gateway) is at or under the session or
+    ceiling cap.
+  - **Wildcards:** only a literal host or one leading `*.`, no `*.<tld>`,
+    and no wildcard over 24 multi-tenant or tunnel suffixes (amazonaws,
+    googleapis, blob.core.windows.net, cloudfront, workers.dev, ngrok*,
+    trycloudflare, ...).
+  - **Route hosts:** no CONNECT pattern covers a route host.
+  - **Route paths:** each route lists its paths; the first segment is
+    literal (so not `/*/info/refs`); no `**`.
+  - **Spend:** a metered route that is granted needs a session cap.
+  - **fs:** no `deny` (Landlock has none); no write of `/` or `~`; nothing
+    overlapping `~/.config`.
+  - **Shape:** unknown keys, schema, `placement` other than laptop,
+    `deny_private: false`, a tool the compiler can't sandbox (git and npm
+    only), a git cap without github, an npm cap without egress.
+  - **Warnings:** image not pinned to a digest, a gateway route left out of
+    the ceiling, a ceiling route granted to no one.
+- Tests: 6 new (`CompileTest`); tether 66 + leash 14 = **80 OK**. Ruff,
+  shellcheck and `/bin/bash -n` are clean.
+- **Cage, booted from the compiled output** (Landlock kernel, tether
+  gateway):
+  - `check` 6/6;
+  - `users` 18/18;
+  - **`nono` 19/19**;
+  - **`proc` 11/11**.
+  - Caps are minted by grant, and the audit attributes `tether-cage claude
+    git`/`npm`, `claude -`.
+  - The installed `/etc/tether/nono/claude.json` equals the compiled one.
+  - Boot to first exec: 0.38 s. No model calls.
+- Design correction added: JSON, not YAML. The rule "tool grants ⊆
+  agent's" covers files only; a tool's network grants are checked against
+  the ceiling, since the design's own example gives git a route its agent
+  lacks.
+- Not done: the audit sink is fixed at `state_dir/audit.jsonl` (any other
+  `file:` path gets a warning). `gateway.spend.total_usd_per_day` passes
+  through unchecked against any ceiling.
 
 ## 7. Adversarial suite
 

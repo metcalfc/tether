@@ -29,6 +29,7 @@ Stdlib only. Python 3.10+.
     tether serve  -c policy.json   run the gateway
     tether report -c policy.json   spend and denials per session, from the audit log
     tether audit  -c policy.json   verify: walk the audit's hash chain; exit 1 at the first break
+    tether compile POLICY -o DIR   one rl/poc-1 policy -> msb flags, nono profiles, tether config
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ import posixpath
 import re
 import secrets
 import select
+import shlex
 import socket
 import socketserver
 import ssl
@@ -250,6 +252,8 @@ class Policy:
         self.cap_total: float | None = sp.get("total_usd_per_day")
         self.max_inflight: int = int(sp.get("max_inflight", 4))
         self.prices: dict[str, list[float]] = cfg.get("prices_per_mtok", {"default": [5, 25]})
+        # From `tether compile`: what each agent's cap and each of its tools' caps may do.
+        self.grants: dict[str, Any] = cfg.get("grants", {})
 
 
 # ------------------------------------------------------- capability registry
@@ -1673,6 +1677,529 @@ def build_servers(policy: Policy) -> tuple[dict[str, Server], Gateway]:
     return srvs, gw
 
 
+# ------------------------------------------------------------------ compiler
+
+POLICY_SCHEMA = "rl/poc-1"
+BUILTIN_PRICES: dict[str, list[float]] = {
+    "claude-opus": [5, 25],
+    "claude-sonnet": [3, 15],
+    "claude-haiku": [1, 5],
+    "default": [5, 25],
+}
+# Domains where anyone can get a name. A wildcard over one of them on a
+# CONNECT allowlist reaches every tenant: `*.s3.amazonaws.com` is a way out
+# to any bucket, `*.ngrok.io` to any laptop.
+MULTI_TENANT = (
+    "amazonaws.com",
+    "googleapis.com",
+    "blob.core.windows.net",
+    "azurewebsites.net",
+    "cloudfront.net",
+    "appspot.com",
+    "firebaseio.com",
+    "r2.dev",
+    "r2.cloudflarestorage.com",
+    "workers.dev",
+    "pages.dev",
+    "herokuapp.com",
+    "vercel.app",
+    "netlify.app",
+    "github.io",
+    "githubusercontent.com",
+    "ngrok.io",
+    "ngrok.app",
+    "ngrok-free.app",
+    "trycloudflare.com",
+    "loca.lt",
+    "serveo.net",
+    "pipedream.net",
+    "webhook.site",
+)
+GUEST_CAP_DIR = "/run/tether"
+GUEST_NONO = "/opt/nono"
+GUEST_TETHER = "/opt/tether"
+# Read by every session: nono itself and tether's launchers.
+SESSION_READ = [GUEST_NONO, GUEST_TETHER]
+TOOL_READ = ["/usr", "/etc"]
+BASE_ENV = ["HOME", "USER", "LOGNAME", "LANG", "TERM", "TZ"]
+# git sets these for the git it runs next (clone -> index-pack needs GIT_DIR).
+GIT_ENV = BASE_ENV + [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_PROTOCOL",
+]
+# The tools the compiler knows how to sandbox, and the cap format each reads.
+# nono 0.80 cannot put a file in a tool's environment and a command sandbox
+# may exec only its pinned executable, so every cap is a file in the tool's
+# own config format (see the design's Corrections).
+TOOL_FORMATS = {"git": "gitconfig", "npm": "npmrc"}
+POLICY_KEYS = {
+    "": {"schema", "machine", "gateway", "agents", "ceiling", "audit", "placement", "state_dir"},
+    "machine": {"name", "image", "cpus", "memory", "humans", "port", "sessions", "mounts"},
+    "gateway": {"credentials", "routes", "egress", "spend"},
+    "route": {"upstream", "credential", "inject", "paths", "meter"},
+    "egress": {"deny_private", "ports", "allow_addresses"},
+    "spend": {"prices", "session_usd_per_day", "total_usd_per_day", "max_inflight"},
+    "agent": {"fs", "routes", "egress", "spend_usd", "settings", "tools"},
+    "tool": {"fs", "routes", "egress", "spend_usd", "argv_prepend"},
+    "fs": {"write", "write_file", "read", "deny"},
+    "ceiling": {"routes", "egress", "spend"},
+}
+
+
+class Lints:
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def keys(self, where: str, kind: str, obj: Any) -> dict[str, Any]:
+        if not isinstance(obj, dict):
+            self.errors.append(f"{where or 'policy'}: must be an object")
+            return {}
+        for k in obj:
+            if not k.startswith("_") and k not in POLICY_KEYS[kind]:
+                self.errors.append(f"{where or 'policy'}: unknown key {k!r}")
+        return obj
+
+
+def egress_lint(pat: str) -> str | None:
+    """Why a CONNECT allowlist entry is too wide (None if it is fine)."""
+    if pat == "*" or any(c in pat for c in "?[]") or "*" in pat[2:] or ("*" in pat and not pat.startswith("*.")):
+        return "use a literal host or one leading '*.'"
+    if pat.startswith("*."):
+        suffix = pat[2:]
+        if suffix.count(".") < 1:
+            return f"'*.' over a public suffix ({suffix})"
+        for m in MULTI_TENANT:
+            if suffix == m or suffix.endswith("." + m) or m.endswith("." + suffix):
+                return f"wildcard over {m}, where anyone can get a name"
+    return None
+
+
+def route_path_lint(path: str) -> str | None:
+    if not path.startswith("/"):
+        return "paths start with /"
+    if "**" in path:
+        return "'**' (fnmatch's '*' already crosses '/'; spell out each segment)"
+    first = path.split("/")[1] if path.count("/") >= 1 else ""
+    if not first or any(c in first for c in "*?["):
+        return "the first segment must be literal (an owner or API version), or the route grants everything"
+    return None
+
+
+def path_within(p: str, outer: str) -> bool:
+    p, outer = p.rstrip("/") or "/", outer.rstrip("/") or "/"
+    return p == outer or outer == "/" or p.startswith(outer + "/")
+
+
+def expand_home(p: str, home: str) -> str:
+    return home + p[1:] if p == "~" or p.startswith("~/") else p
+
+
+def fs_lints(lints: Lints, where: str, fs: dict[str, Any], home: str) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for k in ("write", "write_file", "read"):
+        vals = fs.get(k, [])
+        if not isinstance(vals, list) or not all(isinstance(v, str) for v in vals):
+            lints.errors.append(f"{where}.fs.{k}: must be a list of paths")
+            vals = []
+        paths = [expand_home(v, home) for v in vals]
+        for raw, p in zip(vals, paths, strict=True):
+            if not p.startswith("/"):
+                lints.errors.append(f"{where}.fs.{k}: {raw}: use an absolute path or ~/")
+            elif k != "read" and p.rstrip("/") in ("", home):
+                why = "nono's own state lives under ~/.local/state/nono" if p.rstrip("/") == home else "everything"
+                lints.errors.append(f"{where}.fs.{k}: {raw} is too wide ({why})")
+            elif path_within(p, f"{home}/.config") or path_within(f"{home}/.config", p):
+                lints.errors.append(f"{where}.fs.{k}: {raw} overlaps nono's built-in credential denies in ~/.config")
+        out[k] = paths
+    if fs.get("deny"):
+        lints.errors.append(
+            f"{where}.fs.deny: Landlock has no deny, and nono refuses a deny inside an allow; "
+            "narrow the allows instead (nono's exec gate covers planted .git config)"
+        )
+    return out
+
+
+def net_lints(
+    lints: Lints, where: str, spec: dict[str, Any], ceiling_routes: list[str], ceiling_egress: list[str]
+) -> tuple[list[str], list[str], float | None]:
+    routes, egress = spec.get("routes", []), spec.get("egress", [])
+    if not isinstance(routes, list) or not isinstance(egress, list):
+        lints.errors.append(f"{where}: routes and egress are lists")
+        return [], [], None
+    egress = [h.lower() for h in egress]
+    for r in routes:
+        if r not in ceiling_routes:
+            lints.errors.append(f"{where}: route {r} is not in the ceiling ({' '.join(ceiling_routes) or 'none'})")
+    for h in egress:
+        why = egress_lint(h)
+        if why:
+            lints.errors.append(f"{where}: egress {h}: {why}")
+        elif not any(pattern_within(h, c) for c in ceiling_egress):
+            lints.errors.append(f"{where}: egress {h} is wider than the ceiling ({' '.join(ceiling_egress) or 'none'})")
+    spend = spec.get("spend_usd")
+    if spend is not None and (not isinstance(spend, (int, float)) or spend < 0):
+        lints.errors.append(f"{where}: spend_usd must be a non-negative number")
+        spend = None
+    return routes, egress, spend
+
+
+def nono_profile(
+    agent: str, home: str, port: int, fs: dict[str, list[str]], tools: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """agent's nono session sandbox, and a command policy per tool. Each
+    tool's cap is a raw-file credential: a grant of one file to one command
+    sandbox. The session itself never gets read access to /run/tether."""
+    net = {"tcp_connect_ports": [port]}
+    creds: dict[str, Any] = {}
+    commands: dict[str, Any] = {}
+    for t, spec in tools.items():
+        cap = f"{GUEST_CAP_DIR}/{agent}/{t}"
+        creds[f"{t}-cap"] = {"type": "raw-file", "path": cap}
+        box: dict[str, Any] = {
+            "fs_read": spec["fs"]["read"] or TOOL_READ,
+            "fs_write": spec["fs"]["write"],
+            "use_credentials": [f"{t}-cap"],
+        }
+        if t == "git":
+            box["argv_prepend"] = [
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                f"include.path={cap}",
+                *spec["argv_prepend"],
+            ]
+            box["network"] = net
+            box["environment"] = {"allow_vars": GIT_ENV, "set_vars": {"GIT_EXEC_PATH": f"{GUEST_TETHER}/git-exec"}}
+            commands["git"] = {
+                "executable": "/usr/bin/git",
+                "can_use": ["git-remote-http"],
+                "export_env": ["GIT_*"],
+                "sandbox": box,
+            }
+            # The rewrite points at the plain-HTTP gateway, so git's helper is
+            # git-remote-http, run as a second command with the same file.
+            commands["git-remote-http"] = {
+                "executable": "/usr/lib/git-core/git-remote-http",
+                "from": {
+                    "session": "deny",
+                    "git": {
+                        "sandbox": {
+                            "fs_read": box["fs_read"],
+                            "fs_write": box["fs_write"],
+                            "use_credentials": [f"{t}-cap"],
+                            "allow_raw_file_credentials_in_chained_policy": True,
+                            "network": net,
+                        }
+                    },
+                },
+            }
+        elif t == "npm":
+            # npm is a node script; the command sandbox may exec only this file.
+            box["argv_prepend"] = [
+                "/usr/local/lib/node_modules/npm/bin/npm-cli.js",
+                "--userconfig",
+                cap,
+                *spec["argv_prepend"],
+            ]
+            box["network"] = net
+            box["environment"] = {"allow_vars": BASE_ENV}
+            commands["npm"] = {"executable": "/usr/local/bin/node", "sandbox": box}
+    return {
+        "meta": {"name": f"tether-{agent}", "description": f"tether session sandbox for agent {agent}"},
+        "filesystem": {
+            "allow": fs["write"],
+            "allow_file": fs["write_file"],
+            "read": fs["read"] + [p for p in SESSION_READ if p not in fs["read"]],
+        },
+        "network": {"connect_port": [port]},
+        "workdir": {"access": "readwrite"},
+        "command_policies": {"credentials": creds, "commands": commands},
+    }
+
+
+def compile_policy(src: Path) -> tuple[dict[str, Any], Lints]:
+    """One rl/poc-1 policy file -> what each layer runs. Returns the outputs
+    (`msb_args`, `machine_env`, `nono`, `settings`, `tether`, `caps`) and the
+    lints; nothing is usable if there are errors. Credentials are named, never
+    resolved: the compiler never runs a keychain command."""
+    lints = Lints()
+    try:
+        raw = src.read_bytes()
+        cfg = json.loads(raw)
+    except (OSError, ValueError) as e:
+        lints.errors.append(f"{src}: {e}")
+        return {}, lints
+    cfg = lints.keys("", "", cfg)
+    if cfg.get("schema") != POLICY_SCHEMA:
+        lints.errors.append(f"schema: want {POLICY_SCHEMA!r}, got {cfg.get('schema')!r}")
+    if cfg.get("placement", "laptop") != "laptop":
+        lints.errors.append("placement: only 'laptop' is implemented in the PoC")
+
+    m = lints.keys("machine", "machine", cfg.get("machine", {}))
+    name = m.get("name", "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", name or ""):
+        lints.errors.append(f"machine.name: {name!r} is not a sandbox name")
+    port = m.get("port", 18001)
+    if not isinstance(port, int) or not 1024 <= port <= 65535:
+        lints.errors.append(f"machine.port: {port!r} is not an unprivileged port")
+        port = 18001
+    sessions = m.get("sessions", [name])
+    humans = m.get("humans", [])
+
+    gw = lints.keys("gateway", "gateway", cfg.get("gateway", {}))
+    ceil = lints.keys("ceiling", "ceiling", cfg.get("ceiling", {}))
+    ceiling_routes: list[str] = ceil.get("routes", [])
+    ceiling_egress: list[str] = [h.lower() for h in ceil.get("egress", [])]
+    for h in ceiling_egress:
+        why = egress_lint(h)
+        if why:
+            lints.errors.append(f"ceiling.egress: {h}: {why}")
+
+    creds: dict[str, str] = gw.get("credentials", {})
+    routes_out: dict[str, Any] = {}
+    route_hosts: dict[str, str] = {}
+    metered: list[str] = []
+    for rname, rc in gw.get("routes", {}).items():
+        rc = lints.keys(f"gateway.routes.{rname}", "route", rc)
+        if rname not in ceiling_routes:
+            lints.warnings.append(f"gateway.routes.{rname}: not in the ceiling; left out of tether's config")
+            continue
+        up = urllib.parse.urlsplit(rc.get("upstream", ""))
+        if up.scheme != "https" or not up.hostname:
+            lints.errors.append(f"gateway.routes.{rname}: upstream must be an https:// URL")
+        route_hosts[rname] = (up.hostname or "").lower()
+        cref = rc.get("credential", "")
+        spec = creds.get(cref)
+        if spec is None:
+            lints.errors.append(f"gateway.routes.{rname}: credential {cref!r} is not in gateway.credentials")
+            spec = ""
+        elif spec.startswith("keychain:"):
+            spec = f"cmd:security find-generic-password -s {spec[9:]} -w"
+        elif not spec.startswith(("cmd:", "env:", "file:")):
+            lints.errors.append(f"gateway.credentials.{cref}: use keychain:, cmd:, env: or file:")
+        paths = rc.get("paths", [])
+        if not paths:
+            lints.errors.append(f"gateway.routes.{rname}: list its paths (a route with none allows every path)")
+        for p in paths:
+            why = route_path_lint(p)
+            if why:
+                lints.errors.append(f"gateway.routes.{rname}: path {p}: {why}")
+        if rc.get("meter"):
+            metered.append(rname)
+        routes_out[rname] = {
+            "upstream": rc.get("upstream", ""),
+            "credential": spec,
+            "inject": rc.get("inject", "bearer"),
+            "paths": paths,
+            "meter": bool(rc.get("meter")),
+        }
+    for r in ceiling_routes:
+        if r not in gw.get("routes", {}):
+            lints.errors.append(f"ceiling.routes: {r} is not a gateway route")
+
+    eg = lints.keys("gateway.egress", "egress", gw.get("egress", {}))
+    if eg.get("deny_private", True) is not True:
+        lints.errors.append(
+            "gateway.egress.deny_private: tether always refuses private addresses; list exceptions in allow_addresses"
+        )
+    sp = lints.keys("gateway.spend", "spend", gw.get("spend", {}))
+    csp = lints.keys("ceiling.spend", "spend", ceil.get("spend", {}))
+    ceiling_cap = csp.get("session_usd_per_day")
+    session_cap = sp.get("session_usd_per_day", ceiling_cap)
+    if session_cap is not None and ceiling_cap is not None and session_cap > ceiling_cap:
+        lints.errors.append(f"gateway.spend.session_usd_per_day ${session_cap} is above the ceiling's ${ceiling_cap}")
+    prices = sp.get("prices", "builtin")
+    if prices == "builtin":
+        prices = BUILTIN_PRICES
+    elif not isinstance(prices, dict) or "default" not in prices:
+        lints.errors.append("gateway.spend.prices: 'builtin', or a map of model prefix -> [in, out] with a default")
+        prices = BUILTIN_PRICES
+
+    # Every host a CONNECT may reach: none of them may be a credentialed host,
+    # or an agent can carry its own key there and use the provider as a dead drop.
+    def no_route_hosts(where: str, pats: list[str]) -> None:
+        for h in pats:
+            for rname, host in route_hosts.items():
+                if fnmatch.fnmatchcase(host, h):
+                    lints.errors.append(f"{where}: egress {h} covers {host}, the {rname} route's host")
+
+    no_route_hosts("ceiling", ceiling_egress)
+
+    state_dir = (src.parent / cfg.get("state_dir", "run/tether")).resolve()
+    advertise = f"http://host.microsandbox.internal:{port}"
+    grants: dict[str, Any] = {}
+    profiles: dict[str, Any] = {}
+    settings: dict[str, Any] = {}
+    caps: list[tuple[str, str]] = []
+    granted_metered: set[str] = set()
+    agents = cfg.get("agents", {})
+    if not agents:
+        lints.errors.append("agents: name at least one")
+    for a, ac in agents.items():
+        where = f"agents.{a}"
+        if not re.fullmatch(r"[a-z][a-z0-9-]{0,30}", a) or a in humans or a in ("root", "work"):
+            lints.errors.append(f"{where}: {a!r} is not a usable agent user name")
+        ac = lints.keys(where, "agent", ac)
+        home = f"/home/{a}"
+        afs = fs_lints(lints, where, lints.keys(f"{where}.fs", "fs", ac.get("fs", {})), home)
+        routes, egress, spend = net_lints(lints, where, ac, ceiling_routes, ceiling_egress)
+        no_route_hosts(where, egress)
+        granted_metered.update(r for r in routes if r in metered)
+        if spend is not None and session_cap is not None and spend > session_cap:
+            lints.errors.append(f"{where}: spend_usd ${spend} is above the session cap ${session_cap}")
+        g: dict[str, Any] = {"routes": routes, "egress": egress, "spend_usd": spend, "format": "env", "tools": {}}
+        caps.append((a, "agent"))
+        tools: dict[str, dict[str, Any]] = {}
+        for t, tc in ac.get("tools", {}).items():
+            tw = f"{where}.tools.{t}"
+            tc = lints.keys(tw, "tool", tc)
+            if t not in TOOL_FORMATS:
+                lints.errors.append(f"{tw}: the compiler knows how to sandbox {', '.join(TOOL_FORMATS)} only")
+                continue
+            tfs = fs_lints(lints, tw, lints.keys(f"{tw}.fs", "fs", tc.get("fs", {})), home)
+            # A tool runs inside its agent's session: its files must be inside the agent's.
+            for k, outer in (("write", afs["write"]), ("read", afs["read"] + afs["write"] + TOOL_READ)):
+                for p in tfs[k]:
+                    if not any(path_within(p, o) for o in outer):
+                        lints.errors.append(f"{tw}.fs.{k}: {p} is outside {a}'s grants")
+            if tfs["write_file"]:
+                lints.errors.append(f"{tw}.fs.write_file: not supported for tools")
+            troutes, tegress, tspend = net_lints(lints, tw, tc, ceiling_routes, ceiling_egress)
+            no_route_hosts(tw, tegress)
+            granted_metered.update(r for r in troutes if r in metered)
+            if tspend is not None and session_cap is not None and tspend > session_cap:
+                lints.errors.append(f"{tw}: spend_usd ${tspend} is above the session cap ${session_cap}")
+            if t == "git" and "github" not in troutes:
+                lints.errors.append(f"{tw}: a git cap needs the github route")
+            if t == "npm" and not tegress:
+                lints.errors.append(f"{tw}: an npm cap needs an egress grant (its registry)")
+            argv = tc.get("argv_prepend", [])
+            if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
+                lints.errors.append(f"{tw}.argv_prepend: a list of strings")
+                argv = []
+            tools[t] = {"fs": tfs, "argv_prepend": argv}
+            g["tools"][t] = {"routes": troutes, "egress": tegress, "spend_usd": tspend, "format": TOOL_FORMATS[t]}
+            caps.append((a, t))
+        grants[a] = g
+        profiles[a] = nono_profile(a, home, port, afs, tools)
+        if ac.get("settings"):
+            if not isinstance(ac["settings"], dict):
+                lints.errors.append(f"{where}.settings: an object (Claude Code settings.json)")
+            else:
+                settings[a] = ac["settings"]
+    for r in sorted(granted_metered):
+        if session_cap is None:
+            lints.errors.append(f"route {r} is metered and granted, but there is no session spend cap")
+    for r in ceiling_routes:
+        if r in routes_out and not any(
+            r in g["routes"] or any(r in tg["routes"] for tg in g["tools"].values()) for g in grants.values()
+        ):
+            lints.warnings.append(f"ceiling route {r} is granted to no agent or tool")
+
+    audit = cfg.get("audit", {"sink": "file:audit.jsonl"})
+    if not str(audit.get("sink", "")).startswith("file:"):
+        lints.errors.append("audit.sink: only file: is implemented (team-mode sinks are out of scope)")
+    elif audit["sink"] != "file:audit.jsonl":
+        lints.warnings.append("audit.sink: tether writes state_dir/audit.jsonl; the path is ignored")
+
+    msb_args = ["create", m.get("image", ""), "--name", name]
+    if "cpus" in m:
+        msb_args += ["--cpus", str(m["cpus"])]
+    if "memory" in m:
+        msb_args += ["--memory", str(m["memory"])]
+    msb_args += ["--net-default", "deny", "--net-rule", f"allow@host:tcp:{port}", "--tmpfs", GUEST_CAP_DIR]
+    for mnt in m.get("mounts", []):
+        msb_args += ["--mount-dir", str(Path(mnt.split(":", 1)[0]).expanduser()) + ":" + mnt.split(":", 1)[1]]
+    if not m.get("image"):
+        lints.errors.append("machine.image: required (pin a digest for anything but the PoC)")
+    elif "@sha256:" not in m["image"]:
+        lints.warnings.append(f"machine.image: {m['image']} is not pinned to a digest")
+
+    tether_cfg = {
+        "_note": f"compiled by `tether compile` from {src.name}; do not edit, recompile",
+        "compiled_from": {"path": str(src.resolve()), "sha256": hashlib.sha256(raw).hexdigest()[:12]},
+        "state_dir": str(state_dir),
+        "sandboxes": {name: {"listen": f"127.0.0.1:{port}", "advertise": advertise, "sessions": sessions}},
+        "routes": routes_out,
+        "egress": {
+            "allow": ceiling_egress,
+            "ports": eg.get("ports", [443]),
+            "allow_addresses": eg.get("allow_addresses", []),
+        },
+        "spend": {
+            "per_session_usd_per_day": session_cap,
+            "total_usd_per_day": sp.get("total_usd_per_day"),
+            "max_inflight": sp.get("max_inflight", 4),
+        },
+        "prices_per_mtok": prices,
+        "grants": grants,
+    }
+    machine_env = {
+        "CAGE_NAME": name,
+        "CAGE_PORT": str(port),
+        "CAGE_SESSION": sessions[0] if sessions else name,
+        "CAGE_AGENTS": " ".join(agents),
+        "CAGE_HUMANS": " ".join(humans),
+    }
+    out = {
+        "msb_args": msb_args,
+        "machine_env": machine_env,
+        "nono": profiles,
+        "settings": settings,
+        "tether": tether_cfg,
+        "caps": caps,
+    }
+    return out, lints
+
+
+def write_compiled(out: dict[str, Any], dest: Path) -> list[Path]:
+    """Lay the outputs out under dest; returns the files written."""
+    dest.mkdir(parents=True, exist_ok=True)
+    (dest / "nono").mkdir(exist_ok=True)
+    (dest / "settings").mkdir(exist_ok=True)
+    files: dict[Path, str] = {
+        dest / "msb.args": "\n".join(out["msb_args"]) + "\n",
+        dest / "machine.env": "".join(f"{k}={shlex.quote(v)}\n" for k, v in out["machine_env"].items()),
+        dest / "tether.json": json.dumps(out["tether"], indent=2) + "\n",
+        dest / "caps.list": "".join(f"{a} {t}\n" for a, t in out["caps"]),
+    }
+    for a, prof in out["nono"].items():
+        files[dest / "nono" / f"{a}.json"] = json.dumps(prof, indent=2) + "\n"
+    for a, s in out["settings"].items():
+        files[dest / "settings" / f"{a}.json"] = json.dumps(s, indent=2) + "\n"
+    for stale in [*(dest / "nono").glob("*.json"), *(dest / "settings").glob("*.json")]:
+        if stale not in files:
+            stale.unlink()
+    for p, body in files.items():
+        p.write_text(body)
+    return list(files)
+
+
+def cmd_compile(args: argparse.Namespace) -> None:
+    out, lints = compile_policy(args.source)
+    for w in lints.warnings:
+        log(f"warning: {w}")
+    for e in lints.errors:
+        log(f"error: {e}")
+    if lints.errors:
+        raise SystemExit(f"tether: {args.source}: {len(lints.errors)} error(s); nothing written")
+    if args.check:
+        log(f"{args.source}: ok ({len(out['caps'])} caps, {len(out['nono'])} nono profiles)")
+        return
+    for p in write_compiled(out, args.out):
+        log(f"wrote {p}")
+
+
 # ----------------------------------------------------------------------- cli
 
 
@@ -1702,6 +2229,19 @@ def cmd_cap(policy: Policy, args: argparse.Namespace) -> None:
             raise SystemExit("tether: --no-route/--no-egress contradict --route/--egress")
         egress = [] if args.no_egress else [h.lower() for h in args.egress] if args.egress else None
         routes = [] if args.no_route else args.route
+        if args.grant:
+            if args.agent or args.tool or args.route or args.egress or args.no_route or args.no_egress or args.spend:
+                raise SystemExit("tether: --grant sets agent, tool, routes, egress and spend; drop the others")
+            args.agent, _, args.tool = args.grant.partition("/")
+            g = policy.grants.get(args.agent)
+            if g and args.tool:
+                g = g.get("tools", {}).get(args.tool)
+            if not g:
+                raise SystemExit(f"tether: no grant {args.grant!r} in {policy.path} (compile the policy first)")
+            args.tool = args.tool or None
+            routes, egress, args.spend = g["routes"], g["egress"], g.get("spend_usd")
+            args.format = args.format or g.get("format", "env")
+        args.format = args.format or "env"
         errs = grant_errors(policy, routes, egress, args.spend)
         if args.format != "env" and not args.env:
             errs.append(f"--format {args.format} needs --env PATH (or -)")
@@ -1869,7 +2409,8 @@ def main(argv: list[str] | None = None) -> None:
     m.add_argument("--no-route", action="store_true", help="no routes at all (a CONNECT-only tool)")
     m.add_argument("--no-egress", action="store_true", help="no CONNECT egress at all (a routes-only tool)")
     m.add_argument("--env", type=Path, help="write an env file (0600) instead of printing the cap; - for stdout")
-    m.add_argument("--format", choices=CAP_FORMATS, default="env", help="shape of the --env file (default env)")
+    m.add_argument("--format", choices=CAP_FORMATS, help="shape of the --env file (default env, or the grant's)")
+    m.add_argument("--grant", metavar="AGENT[/TOOL]", help="take the grants `tether compile` wrote for it")
     r = csub.add_parser("revoke", help="revoke caps; takes effect on the next request")
     r.add_argument("cap_id", nargs="*")
     r.add_argument("--sandbox")
@@ -1879,7 +2420,14 @@ def main(argv: list[str] | None = None) -> None:
     ls = csub.add_parser("list", help="caps and their state (never the caps themselves)")
     ls.add_argument("--all", action="store_true", help="include revoked and expired")
     ls.add_argument("--json", action="store_true")
+    cc = sub.add_parser("compile", help="one rl/poc-1 policy -> msb flags, nono profiles, tether config")
+    cc.add_argument("source", type=Path)
+    cc.add_argument("-o", "--out", type=Path, default=Path("run/compiled"), help="output directory")
+    cc.add_argument("--check", action="store_true", help="lint only, write nothing")
     args = ap.parse_args(argv)
+    if args.cmd == "compile":  # reads the source policy, not -c; never resolves a credential
+        cmd_compile(args)
+        return
     policy = Policy(args.config)
     if args.cmd == "init":
         cmd_init(policy)

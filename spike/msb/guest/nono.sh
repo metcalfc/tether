@@ -2,13 +2,15 @@
 # nono.sh -- one nono session sandbox per agent, a command policy per tool,
 # and caps delivered through the /run/tether tmpfs. Run as guest root.
 #
-#   nono.sh setup            profiles in /etc/tether/nono, launchers in /opt/tether/bin
+#   nono.sh setup            install the compiled profiles in /etc/tether/nono (and
+#                            Claude settings), launchers in /opt/tether/bin
 #   nono.sh put AGENT NAME   store stdin (a tether env file) as /run/tether/AGENT/NAME
 #   nono.sh run AGENT CMD..  run CMD as AGENT inside its session sandbox
 #   nono.sh check            prove who holds which cap, and what each can reach
 #   nono.sh proc             try /proc and ptrace routes to another tool's cap
 #
-# Each agent's session sandbox (Landlock V6, as the agent's UID) gets /work,
+# The profiles are `tether compile` output (tether's nono_profile); this
+# script only installs them. Each agent's session sandbox (Landlock V6, as the agent's UID) gets /work,
 # a few dot-directories in its home and TCP connect to the gateway port only.
 # The agent's own cap is in the session's environment. A tool's cap is not:
 # it sits in /run/tether/<agent>/<tool> (root:<agent> 0440), and nono 0.80's
@@ -30,6 +32,8 @@ PORT=${CAGE_PORT:-18001}
 PROFILES=/etc/tether/nono
 BIN=/opt/tether/bin
 NONO=/opt/nono/nono
+# What tether compile emitted, pushed here by cage.sh: nono/<agent>.json, settings/<agent>.json.
+COMPILED=/opt/leash
 
 log() { printf '[nono] %s\n' "$*"; }
 
@@ -50,90 +54,6 @@ EOF
   chmod 0755 "$BIN/agent-session"
 }
 
-write_profile() { # write_profile AGENT
-  python3 - "$1" "$PORT" "$PROFILES/$1.json" <<'EOF'
-import json, sys
-
-a, port, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
-home = f"/home/{a}"
-base_env = ["HOME", "USER", "LOGNAME", "LANG", "TERM", "TZ"]
-# git sets these for the git it runs next (clone -> index-pack needs GIT_DIR).
-git_env = base_env + [
-    "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_PREFIX", "GIT_SHALLOW_FILE", "GIT_CONFIG_PARAMETERS", "GIT_PROTOCOL",
-]
-read = ["/usr", "/etc"]
-net = {"tcp_connect_ports": [port]}
-git_cap, npm_cap = f"/run/tether/{a}/git", f"/run/tether/{a}/npm"
-
-profile = {
-    "meta": {"name": f"tether-{a}", "description": f"tether session sandbox for agent {a}"},
-    "filesystem": {
-        # Not the whole home: nono refuses a grant over its own state root
-        # (~/.local/state/nono), and ~/.config collides with its built-in
-        # credential denies (~/.config/gcloud, ...), so grant what the agent uses.
-        "allow": ["/work", "/tmp", f"{home}/.claude", f"{home}/.cache", f"{home}/.npm"],
-        "allow_file": [f"{home}/.claude.json"],
-        "read": ["/usr", "/etc", "/opt/nono", "/opt/tether"],
-    },
-    "network": {"connect_port": [port]},
-    "workdir": {"access": "readwrite"},
-    "command_policies": {
-        "credentials": {
-            "git-cap": {"type": "raw-file", "path": git_cap},
-            "npm-cap": {"type": "raw-file", "path": npm_cap},
-        },
-        "commands": {
-            "git": {
-                "executable": "/usr/bin/git",
-                "can_use": ["git-remote-http"],
-                "export_env": ["GIT_*"],
-                "sandbox": {
-                    "fs_read": read,
-                    "fs_write": ["/work", "/tmp"],
-                    "use_credentials": ["git-cap"],
-                    "argv_prepend": [
-                        "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", f"include.path={git_cap}",
-                    ],
-                    "network": net,
-                    "environment": {"allow_vars": git_env, "set_vars": {"GIT_EXEC_PATH": "/opt/tether/git-exec"}},
-                },
-            },
-            "git-remote-http": {
-                "executable": "/usr/lib/git-core/git-remote-http",
-                "from": {
-                    "session": "deny",
-                    "git": {
-                        "sandbox": {
-                            "fs_read": read,
-                            "fs_write": ["/work", "/tmp"],
-                            "use_credentials": ["git-cap"],
-                            "allow_raw_file_credentials_in_chained_policy": True,
-                            "network": net,
-                        }
-                    },
-                },
-            },
-            "npm": {
-                # npm is a node script; the command sandbox may exec only this file.
-                "executable": "/usr/local/bin/node",
-                "sandbox": {
-                    "fs_read": read,
-                    "fs_write": ["/work", "/tmp", f"{home}/.npm"],
-                    "use_credentials": ["npm-cap"],
-                    "argv_prepend": ["/usr/local/lib/node_modules/npm/bin/npm-cli.js", "--userconfig", npm_cap],
-                    "network": net,
-                    "environment": {"allow_vars": base_env},
-                },
-            },
-        },
-    },
-}
-with open(out, "w") as f:
-    json.dump(profile, f, indent=2)
-EOF
-}
-
 cmd_setup() {
   install -d -m 0755 "$PROFILES"
   write_launchers
@@ -143,7 +63,11 @@ cmd_setup() {
     for d in .claude .cache .npm; do install -d -m 0700 -o "$a" -g "$a" "/home/$a/$d"; done
     [[ -f /home/$a/.claude.json ]] || install -m 0600 -o "$a" -g "$a" /dev/null "/home/$a/.claude.json"
     install -d -m 0750 -o root -g "$a" "/run/tether/$a"
-    write_profile "$a"
+    [[ -f $COMPILED/nono/$a.json ]] || { log "no $COMPILED/nono/$a.json: run tether compile, then cage.sh push"; exit 1; }
+    install -m 0644 "$COMPILED/nono/$a.json" "$PROFILES/$a.json"
+    if [[ -f $COMPILED/settings/$a.json ]]; then
+      install -m 0600 -o "$a" -g "$a" "$COMPILED/settings/$a.json" "/home/$a/.claude/settings.json"
+    fi
     $NONO profile validate "$PROFILES/$a.json" 2>&1 | grep -E 'Result|error' | sed "s/^/  $a: /"
   done
   log "profiles in $PROFILES, launchers in $BIN"
