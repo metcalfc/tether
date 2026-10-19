@@ -6,18 +6,21 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 7 is done (run 26: four-stream overshoot, see its notes).
-**Next: milestone 8, item 1: the PoC section of `spike/RESULTS.md`.** Read
-the design's "Success criteria" and "Measurements" lists (around lines
-506-520 of `design/tether-poc.md`), then mark each one pass, fail or not run,
-with numbers taken from the run notes below: boot to agent-ready and TTFB
-(runs 4-5), CONNECT setup, kernel/Landlock (run 6), caps and the adversarial
-suite (runs 22-25), overshoot (run 26). List every fallback taken (none at
-the Day-2 gate) and every design correction. Any measurement the design asks
-for that no run took (for example `npm install` on guest disk vs virtio-fs,
-200 MB `git push` throughput, msb/guest memory, nono launch cost) is either
-measured cheaply in that run or marked "not run". Don't invent numbers.
-Then: demo (item 2), REPORT.md, push, PR, DONE.
+Milestone 8 item 1 is done (run 27: the RESULTS.md PoC section, the
+remaining measurements, a 30-minute soak and a TLS-context latency fix).
+**Next: milestone 8, item 2: the demo.** Adapt `spike/record/demo.tape` to
+the design's demo script (around line 490 of `design/tether-poc.md`) and
+record it with VHS to `overnight/run/poc-demo.mp4`. If VHS can't drive the
+cage unattended, write the exact commands to `overnight/DEMO.md` instead.
+Before recording:
+- start a **fresh tether state dir**, because the old audit file has
+  pre-chain lines and `audit verify` fails on it (run 21 note);
+- use the plain-command path for the README injection (haiku refuses on its
+  own, run 22);
+- use the default model only for the one demo Claude Code run.
+
+Watch the frames for secrets. Then do REPORT.md, the key grep, push, the
+draft PR, and DONE.
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -1276,11 +1279,58 @@ Run 26 (2026-10-19) notes:
 
 ## 8. Demo and write-up
 
-- [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
+- [x] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
 - [ ] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
 - [ ] `overnight/REPORT.md` written
 - [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
 - [ ] `DONE` written to `overnight/STATUS`
+
+Run 27 (2026-10-19) notes:
+
+- `spike/RESULTS.md` has a new section, "PoC: microsandbox + nono + tether".
+  It has every success criterion marked, the measurements table, the
+  fallbacks (none) and the corrections. The numbers come from runs 1-26 plus
+  what this run measured. Boot: compiled output, Landlock kernel, tether
+  gateway. Log: `overnight/run/run27-boot.sh`.
+- **Measured this run:**
+  - **Boot to agent-ready on tether: 20.7 s.** `up` 0.89 s (first exec
+    0.37 s), users 0.92 s, nono setup plus its checks 6.0 s, Claude Code
+    npm install 12.9 s.
+  - **Memory:** msb phys footprint 2.27 GB (RSS 2.15 GB, guest RAM and page
+    cache included); guest 113 MB used, 857 MB cache; tether 29 MB RSS.
+  - **`npm install`** (typescript + eslint + webpack, 5,156 files, warm
+    cache): guest disk 1.24 s, virtio-fs 2.69 s, 3 runs each, in a
+    throwaway second sandbox `tether-npmbench` (removed).
+  - **No real key in any guest process's memory.** New:
+    `spike/msb/guest/memscan.py` (root; reads every readable mapping of
+    every pid; counts real-key shapes and `tth_` caps, never prints a match;
+    `--control` plants a fake key in a child and requires it to be found).
+    94 MiB over 4 userspace processes plus the control: nono's supervisor
+    (25 cap hits), the session `sleep` (6), agentd pid 1 (16), bash. Control
+    found. **Finding:** agentd holds caps, because `cage.sh caps` pipes them
+    through `msb exec` stdin (design Corrections).
+  - **TTFB vs direct, real API, through tether:** n=20 +7.9 ms, n=40
+    **+6.0 ms** at p50, which is over the 5 ms target. New
+    `spike/msb/overhead.py` (local fake upstream, no network, n=200): tether
+    adds **+0.17 ms p50** in-process. So the cost was in the upstream leg:
+    `http.client.HTTPSConnection` without `context=` builds a default context
+    per request, and `ssl.create_default_context()` costs **2.4 ms** here.
+    **Fixed** (commit `5243bcc`): `tls_context()` is one shared verifying
+    context, used for routes and Upgrades, with a unit test
+    (`test_https_upstreams_share_one_verifying_tls_context`, which fails on
+    the old code). After the fix, n=40 twice: -9.5 ms and -25.7 ms, i.e. the
+    API's jitter is larger than the effect. The criterion is marked "pass,
+    after a fix", with all the numbers shown. leash has the same cost
+    (unchanged; it is the baseline).
+  - CONNECT setup through tether, host: 32.2 ms p50 vs 31.2 direct.
+  - **30-minute stream soak:** new `spike/msb/guest/soak.py` (in the guest,
+    as root with the session cap, one streaming haiku call every 6 s, read
+    to `message_stop`): **300 calls in 30.0 min, 0 aborted**, TTFB p50 495
+    / p95 640 / max 749 ms. Log: `overnight/run/run27-soak.log`.
+- Not run, marked so in RESULTS: a 200 MB `git push` (run 12's 100 MiB at
+  ~3 MB/s stands), and a pre-baked image. I skipped the push to keep the run under its time cap.
+- Tests: 94 OK (tether 80 + leash 14). ruff, shellcheck and `/bin/bash -n`
+  clean.
 
 ## Spend log
 
@@ -1296,6 +1346,7 @@ Run 26 (2026-10-19) notes:
 | 22 | 2 (haiku, Claude Code refusing the injected README) | $0.0439 |
 | 23 | 2 (haiku, Claude Code Bash tool check with the sh edge) + 1 refused ($0) | $0.0413 |
 | 26 | 14 allowed + 6 refused at admission (haiku, four-stream overshoot, host tether) | $0.012816 |
+| 27 | 444 via tether (300 soak, 144 TTFB bench, haiku) + ~140 direct bench calls | $0.1565 via tether; direct est. < $0.01 |
 
 ## Decisions and corrections
 
