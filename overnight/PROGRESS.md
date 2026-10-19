@@ -6,25 +6,25 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 6: **streamed request bodies** (design "Changes from
-today's leash"; large `git push`). Today `_read_body` buffers the whole
-request (MAX_BODY 64 MiB) before forwarding. Make `_proxy` stream the body
-upstream as it arrives: Content-Length bodies in chunks, and
-`Transfer-Encoding: chunked` bodies (git sends chunked for big pushes)
-re-chunked to the upstream without buffering. Keep buffering only where a
-route needs the body (metering parses the *response*, so check whether
-anything reads the request body: OAuth beta injection touches headers only).
-Unit tests: a 100 MiB+ chunked body reaches a fake upstream with bounded
-gateway memory (or at least without MAX_BODY refusing it); a Content-Length
-body streams; a client that stops mid-body is audited. Real run: from the
-cage, push a ~100 MB commit to `SCRATCH_REPO` on an `agent/*` branch through
-tether's github route (the policy already allows git-receive-pack on
-tether-scratch), then delete that branch. Use the run-11 tether cage setup:
-`export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib
-CAGE_GW=$PWD/tether CAGE_POLICY=$PWD/overnight/run/tether-msb/policy.json`
-(the policy is a copy of `spike/msb/policy.json` with `state_dir: state`;
-recreate it if `overnight/run/` was wiped), then `spike/msb/cage.sh gw-up`,
-`up`, `exec ...`, `down`.
+Milestone 3, item 7: **`Upgrade` passthrough on routes** (design "Changes
+from today's leash" item 6: Codex and MCP over WebSocket). Today `upgrade`
+and `connection` are in `HOP` and stripped, so a WebSocket handshake on a
+route reaches the upstream as a plain GET. Make `_proxy` detect
+`Connection: upgrade` + `Upgrade: <proto>` on a route request: after the
+usual identify / route / grant checks, open a raw socket (TLS for https
+upstreams) to the route host, send the request line and headers with the
+credential injected and `Upgrade`/`Connection` kept, relay the upstream's
+response head; on **101** hand both sockets to `pump` (as CONNECT does) and
+audit bytes up/down and duration; on any other status relay the response and
+close. Decide whether metered routes may upgrade (probably refuse: the meter
+can't parse WebSocket frames; record the decision). Unit tests: a fake
+upstream that answers 101 and echoes frames bytes-for-bytes through tether,
+the credential is injected and the cap is not forwarded, an ungranted route
+still 403s before any upstream connect, a non-101 answer is relayed. Real
+run: a WebSocket echo through a route if one is reachable from the host
+(e.g. a temporary route to `wss://echo.websocket.org`, not kept in the
+committed policy); otherwise record that only the unit test ran. Cage setup
+as in run 12 (below).
 
 ## 0. Setup
 
@@ -272,7 +272,7 @@ Run 6 (2026-10-18) notes:
 - [x] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [x] Per-cap policy intersected with the ceiling
 - [x] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
-- [ ] Streamed request bodies (large `git push`)
+- [x] Streamed request bodies (large `git push`)
 - [ ] `Upgrade` passthrough on routes
 - [ ] Spend reservations and a max-inflight limit; non-retryable refusal
 - [ ] Hash-chained audit with the new fields and `x-tether-request-id`
@@ -466,6 +466,40 @@ Run 11 (2026-10-19) notes:
   host's resolver returns nothing the rule trips on.
 - Spend this run: 1 Claude Code call via tether (haiku), **$0.0374** (tether
   report, session `cage`; mostly the cache write of Claude Code's prompt).
+
+Run 12 (2026-10-19) notes:
+
+- **`RequestBody`** (new class) replaces `_read_body`. Non-metered routes
+  stream: a Content-Length body is read in 64 KiB pieces and forwarded with
+  the same Content-Length; a chunked body is de-chunked as it arrives and
+  re-chunked upstream (`http.client` `encode_chunked=True` with an iterator).
+  Trailers are dropped. No size limit on streamed routes.
+- **Decision: metered routes still buffer**, bounded by `MAX_BODY` (64 MiB),
+  and go upstream with a Content-Length even if the client sent chunked. A
+  model call is small JSON, and spend reservations (item 8) need its
+  `max_tokens` and size at admission. Nothing reads a non-metered body.
+- Body errors: bad Content-Length or malformed chunk framing -> 400 and an
+  audit `deny`; client stops mid-body (EOF or 120 s idle, `BODY_IDLE_SECS`)
+  -> upstream connection closed, audit `allow` with **status 499**, reason
+  `client stopped mid-body after N bytes`, `bytes_up` N, no response.
+  `bytes_up` is now bytes actually taken from the client (also on 502).
+- **Tests** (5 new): 106 MiB chunked body (over MAX_BODY) reaches a sink
+  intact (sha256) with `tracemalloc` peak < 16 MiB across client, gateway
+  and sink; Content-Length body forwarded with its length, not chunked;
+  client hang-up after 1000 of 1000000 bytes audited 499 / bytes_up 1000;
+  bad chunk size refused and audited; metered route refuses a body over
+  MAX_BODY (patched to 1000) while a streamed route passes it, and a chunked
+  model call goes upstream with Content-Length. `make test`: **58 tests OK**
+  (leash 14 unchanged, tether 44). ruff and shellcheck clean.
+- **Real run** (tether cage gateway, Landlock kernel, 4 GiB guest): in the
+  guest, a commit of 100 MiB of `/dev/urandom` pushed with plain `git push`
+  to `agent/stream-test-20261019001321` on `metcalfc/tether-scratch` through
+  the `/github/` route: ok. Audit: `git-receive-pack` 200, **bytes_up
+  104,890,010** (chunked; git's postBuffer is 1 MiB), 34.2 s (~3 MB/s,
+  likely the uplink). Gateway RSS after the push: 38 MB. Branch then
+  deleted through the same route (`git push --delete`); `ls-remote` shows
+  no `stream-test` branch.
+- No model calls this run.
 
 ## 5. Identity in the guest
 

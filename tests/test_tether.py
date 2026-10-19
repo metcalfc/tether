@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import hashlib
 import http.client
 import http.server
 import importlib.machinery
@@ -19,7 +20,9 @@ import ssl
 import tempfile
 import threading
 import time
+import tracemalloc
 import unittest
+import urllib.parse
 from pathlib import Path
 from typing import Any
 
@@ -76,6 +79,48 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         FakeUpstream.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
         out = b"001e# service=git-upload-pack\n0000"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+
+class Sink(http.server.BaseHTTPRequestHandler):
+    """Plays github.com's git-receive-pack: reads a body as it arrives, never holds it."""
+
+    protocol_version = "HTTP/1.1"
+    got: list[dict[str, Any]] = []
+
+    def log_message(self, *a: Any) -> None:
+        pass
+
+    def do_POST(self) -> None:
+        h = hashlib.sha256()
+        n = 0
+        te = self.headers.get("Transfer-Encoding")
+        try:
+            if te == "chunked":
+                while size := int(self.rfile.readline().split(b";")[0], 16):
+                    piece = self.rfile.read(size)
+                    h.update(piece)
+                    n += len(piece)
+                    self.rfile.readline()
+                self.rfile.readline()
+            else:
+                left = int(self.headers.get("Content-Length") or 0)
+                while left:
+                    piece = self.rfile.read(min(left, 65536))
+                    if not piece:
+                        raise ConnectionError("short body")
+                    h.update(piece)
+                    n += len(piece)
+                    left -= len(piece)
+        except (ConnectionError, ValueError) as e:
+            Sink.got.append({"bytes": n, "error": str(e)})
+            self.close_connection = True
+            return
+        Sink.got.append({"bytes": n, "sha256": h.hexdigest(), "te": te, "cl": self.headers.get("Content-Length")})
+        out = json.dumps(Sink.got[-1]).encode()
         self.send_response(200)
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
@@ -437,6 +482,112 @@ class TetherTest(unittest.TestCase):
         p = Path(self.tmp.name) / "bare.json"
         p.write_text("{}")
         self.assertEqual(tether.Policy(p).state_dir, (Path(self.tmp.name) / "run" / "tether").resolve())
+
+    # --- streamed request bodies
+
+    def sink_route(self) -> str:
+        Sink.got = []
+        sink = serve(Sink)
+        self.addCleanup(sink.server_close)
+        self.addCleanup(sink.shutdown)
+        r = self.gw.p.routes["github"]
+        r.upstream = urllib.parse.urlsplit(f"http://127.0.0.1:{sink.server_address[1]}")
+        r.paths = ["/*/info/refs", "/*/git-receive-pack"]
+        return "/github/o/r.git/git-receive-pack"
+
+    def git_auth(self) -> dict[str, str]:
+        return {"Authorization": "Basic " + base64.b64encode(f"x:{self.caps['alice']}".encode()).decode()}
+
+    def test_large_chunked_body_streams_with_bounded_memory(self) -> None:
+        path = self.sink_route()
+        piece = os.urandom(65536)
+        count = 1700  # ~106 MiB: over MAX_BODY, so buffering would have refused it
+        want = hashlib.sha256()
+        for _ in range(count):
+            want.update(piece)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=60)
+        tracemalloc.start()
+        try:
+            c.request("POST", path, (piece for _ in range(count)), self.git_auth(), encode_chunked=True)
+            r = c.getresponse()
+            got = json.loads(r.read())
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+            c.close()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(got["bytes"], count * 65536)
+        self.assertEqual(got["sha256"], want.hexdigest())
+        self.assertEqual(got["te"], "chunked")
+        self.assertLess(peak, 16 * 1024 * 1024)  # client, gateway and sink together
+        self.assertEqual(self.audit()[-1]["bytes_up"], count * 65536)
+
+    def test_content_length_body_streams_with_its_length(self) -> None:
+        path = self.sink_route()
+        body = os.urandom(300_000)
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+        c.request("POST", path, io.BytesIO(body), {"Content-Length": str(len(body)), **self.git_auth()})
+        got = json.loads(c.getresponse().read())
+        c.close()
+        self.assertEqual(got["cl"], str(len(body)))
+        self.assertIsNone(got["te"])
+        self.assertEqual(got["sha256"], hashlib.sha256(body).hexdigest())
+
+    def test_client_stopping_mid_body_is_audited(self) -> None:
+        path = self.sink_route()
+        s = socket.create_connection(("127.0.0.1", self.port))
+        auth = self.git_auth()["Authorization"]
+        s.sendall(
+            f"POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\nContent-Length: 1000000\r\n\r\n".encode()
+            + b"x" * 1000
+        )
+        time.sleep(0.2)
+        s.close()
+        rec: dict[str, Any] = {}
+        for _ in range(50):
+            rec = self.audit()[-1] if self.audit() else {}
+            if rec.get("status") == 499:
+                break
+            time.sleep(0.1)
+        self.assertEqual(rec.get("status"), 499)
+        self.assertIn("mid-body", rec["reason"])
+        self.assertEqual(rec["bytes_up"], 1000)
+
+    def test_malformed_chunk_is_refused(self) -> None:
+        path = self.sink_route()
+        s = socket.create_connection(("127.0.0.1", self.port), timeout=10)
+        auth = self.git_auth()["Authorization"]
+        s.sendall(
+            f"POST {path} HTTP/1.1\r\nHost: x\r\nAuthorization: {auth}\r\nTransfer-Encoding: chunked\r\n\r\n".encode()
+            + b"zz\r\nhello\r\n0\r\n\r\n"
+        )
+        s.recv(65536)
+        s.close()
+        self.assertIn("malformed chunk", self.audit()[-1]["reason"])
+
+    def test_metered_route_still_buffers_with_a_bound(self) -> None:
+        old = tether.MAX_BODY
+        tether.MAX_BODY = 1000
+        try:
+            h = {"Authorization": "Bearer " + self.caps["alice"]}
+            st, out = self.post("/anthropic/v1/messages", {"pad": "x" * 2000}, h)
+            self.assertEqual(st, 400)
+            self.assertIn("too large", json.loads(out)["error"]["message"])
+            self.assertEqual(FakeUpstream.seen, [])
+            # Same size on a streamed route goes through.
+            path = self.sink_route()
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            c.request("POST", path, iter([b"y" * 2000]), self.git_auth(), encode_chunked=True)
+            self.assertEqual(json.loads(c.getresponse().read())["bytes"], 2000)
+            c.close()
+            # A chunked model call is buffered and forwarded with a length.
+            c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
+            c.request("POST", "/anthropic/v1/messages", iter([b'{"stream":', b" true}"]), h, encode_chunked=True)
+            self.assertEqual(c.getresponse().status, 200)
+            c.close()
+            self.assertEqual(FakeUpstream.seen[-1]["headers"]["content-length"], "16")
+        finally:
+            tether.MAX_BODY = old
 
     def test_audit_names_the_sandbox(self) -> None:
         self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})

@@ -75,7 +75,11 @@ HOP = {
     "expect",
 }
 CRED_HEADERS = ("authorization", "x-api-key", "proxy-authorization")
+# Only metered routes buffer the request body (a model call is small JSON, and
+# reservations need its max_tokens); every other route streams it.
 MAX_BODY = 64 * 1024 * 1024
+BODY_CHUNK = 64 * 1024
+BODY_IDLE_SECS = 120
 METER_BODY_LIMIT = 8 * 1024 * 1024
 TUNNEL_IDLE_SECS = 300
 HELLO_TIMEOUT_SECS = 10
@@ -835,6 +839,94 @@ def who(cap: dict[str, Any] | None) -> dict[str, Any]:
     return {k: cap.get(k) for k in ("session", "agent", "tool", "human", "cap_id")}
 
 
+class BodyError(Exception):
+    """The client's request body is malformed, too large, or stopped short."""
+
+
+class RequestBody:
+    """A client request body, forwarded as it arrives.
+
+    Content-Length bodies go upstream with the same length, chunked bodies are
+    re-chunked, so a large `git push` never sits in memory. With buffer=True
+    the body is read up front (bounded by MAX_BODY) and sent with a length.
+    `sent` counts body bytes taken from the client.
+    """
+
+    def __init__(self, rfile: Any, headers: Any, sock: socket.socket, buffer: bool = False) -> None:
+        self.rfile = rfile
+        self.sock = sock
+        self.sent = 0
+        self.data: bytes | None = None
+        self.chunked = "chunked" in (headers.get("Transfer-Encoding") or "").lower()
+        self.length = 0
+        if not self.chunked:
+            try:
+                self.length = int(headers.get("Content-Length") or 0)
+            except ValueError:
+                raise BodyError("bad Content-Length") from None
+            if self.length < 0:
+                raise BodyError("bad Content-Length")
+        if buffer:
+            if self.length > MAX_BODY:
+                raise BodyError("request body too large")
+            out = bytearray()
+            for piece in self._pieces():
+                out += piece
+                if len(out) > MAX_BODY:
+                    raise BodyError("request body too large")
+            self.data = bytes(out)
+            self.chunked, self.length = False, len(self.data)
+
+    def upload(self) -> Iterator[bytes] | bytes | None:
+        if self.data is not None:
+            return self.data or None
+        if not self.chunked and not self.length:
+            return None
+        return self._pieces()
+
+    def _pieces(self) -> Iterator[bytes]:
+        old = self.sock.gettimeout()
+        self.sock.settimeout(BODY_IDLE_SECS)
+        try:
+            yield from (self._chunks() if self.chunked else self._exactly(self.length))
+        except OSError as e:
+            raise BodyError(f"client stopped mid-body after {self.sent} bytes: {e}") from None
+        finally:
+            self.sock.settimeout(old)
+
+    def _exactly(self, n: int) -> Iterator[bytes]:
+        while n:
+            piece = self.rfile.read(min(n, BODY_CHUNK))
+            if not piece:
+                raise BodyError(f"client stopped mid-body after {self.sent} bytes")
+            n -= len(piece)
+            self.sent += len(piece)
+            yield piece
+
+    def _chunks(self) -> Iterator[bytes]:
+        while True:
+            line = self.rfile.readline(65537)
+            if not line.endswith(b"\n"):
+                raise BodyError(f"client stopped mid-body after {self.sent} bytes")
+            try:
+                size = int(line.split(b";")[0].strip(), 16)
+            except ValueError:
+                raise BodyError("malformed chunk size") from None
+            if size < 0:
+                raise BodyError("malformed chunk size")
+            if size == 0:
+                # Trailers are dropped: they are hop-by-hop as far as we care.
+                while True:
+                    t = self.rfile.readline(65537)
+                    if t in (b"\r\n", b"\n"):
+                        return
+                    if not t.endswith(b"\n"):
+                        raise BodyError(f"client stopped mid-body after {self.sent} bytes")
+            yield from self._exactly(size)
+            if self.rfile.readline(65537) not in (b"\r\n", b"\n"):
+                raise BodyError("malformed chunk framing")
+
+
 def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -1007,8 +1099,9 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     self._error(403, "permission_error", blocked)
                     return
             try:
-                body = self._read_body()
-            except ValueError as e:
+                body = RequestBody(self.rfile, self.headers, self.connection, buffer=route.meter)
+            except BodyError as e:
+                gw.audit.write(decision="deny", reason=str(e), **rec)
                 self._error(400, "invalid_request_error", str(e))
                 return
 
@@ -1016,17 +1109,26 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             route.apply(fwd)
             fwd["host"] = route.upstream.netloc
             fwd["accept-encoding"] = "identity"
-            if body:
-                fwd["content-length"] = str(len(body))
+            if body.chunked:
+                fwd["transfer-encoding"] = "chunked"
+            elif body.length:
+                fwd["content-length"] = str(body.length)
             target = route.upstream.path.rstrip("/") + rest + (f"?{query}" if query else "")
             conn_cls = http.client.HTTPSConnection if route.upstream.scheme == "https" else http.client.HTTPConnection
             conn = conn_cls(route.upstream.hostname or "", route.upstream.port, timeout=600)
             try:
-                conn.request(self.command, target, body=body or None, headers=fwd)
+                conn.request(self.command, target, body=body.upload(), headers=fwd, encode_chunked=body.chunked)
                 resp = conn.getresponse()
+            except BodyError as e:
+                # The client stopped mid-body: the upstream got a truncated
+                # request, and there is nothing sane to answer.
+                conn.close()
+                gw.audit.write(decision="allow", status=499, reason=str(e), bytes_up=body.sent, **rec)
+                self.close_connection = True
+                return
             except OSError as e:
                 conn.close()
-                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", bytes_up=body.sent, **rec)
                 self._error(502, "api_error", "upstream error")
                 return
 
@@ -1068,7 +1170,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     decision="allow",
                     status=resp.status,
                     usd=usd,
-                    bytes_up=len(body),
+                    bytes_up=body.sent,
                     bytes_down=down,
                     ms=int((time.monotonic() - t0) * 1000),
                     **rec,
@@ -1076,24 +1178,6 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             if not nobody:
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-
-        def _read_body(self) -> bytes:
-            if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
-                out = bytearray()
-                while True:
-                    size = int(self.rfile.readline(65537).split(b";")[0].strip() or b"0", 16)
-                    if size == 0:
-                        while self.rfile.readline(65537) not in (b"\r\n", b"\n", b""):
-                            pass
-                        return bytes(out)
-                    out += self.rfile.read(size)
-                    self.rfile.readline(65537)
-                    if len(out) > MAX_BODY:
-                        raise ValueError("request body too large")
-            n = int(self.headers.get("Content-Length") or 0)
-            if n < 0 or n > MAX_BODY:
-                raise ValueError("bad Content-Length")
-            return self.rfile.read(n) if n else b""
 
         do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = do_HEAD = _proxy
 
