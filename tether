@@ -28,6 +28,7 @@ Stdlib only. Python 3.10+.
     tether cap    -c policy.json   mint|revoke|list|boot capabilities (live, no restart)
     tether serve  -c policy.json   run the gateway
     tether report -c policy.json   spend and denials per session, from the audit log
+    tether audit  -c policy.json   verify: walk the audit's hash chain; exit 1 at the first break
 """
 
 from __future__ import annotations
@@ -46,6 +47,7 @@ import ipaddress
 import json
 import os
 import posixpath
+import re
 import secrets
 import select
 import socket
@@ -75,6 +77,7 @@ HOP = {
     "host",
     "content-length",
     "expect",
+    "x-tether-request-id",
 }
 CRED_HEADERS = ("authorization", "x-api-key", "proxy-authorization")
 # Only metered routes buffer the request body (a model call is small JSON, and
@@ -94,6 +97,18 @@ UPGRADE_CONNECT_SECS = 30
 # requires max_tokens; OpenAI's APIs don't, and this is their usual ceiling.
 DEFAULT_MAX_TOKENS = 4096
 MAX_TOKENS_KEYS = ("max_tokens", "max_output_tokens", "max_completion_tokens")
+# IDs worth keeping from either side, by header, under the audit field they
+# go to. Only these, and only if they look like IDs: the audit never carries
+# headers wholesale. The client ones are what Claude Code 2.1.303 sends.
+CLIENT_ID_HEADERS = {
+    "x-claude-code-session-id": "client_session_id",
+    "x-claude-code-agent-id": "client_agent_id",
+    "x-claude-code-parent-agent-id": "client_parent_agent_id",
+    "x-claude-code-prompt-id": "client_prompt_id",
+    "x-client-request-id": "client_request_id",
+}
+UPSTREAM_ID_HEADERS = ("request-id", "x-request-id", "x-github-request-id")
+ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 # An aborted stream with no usage is billed at about 4 characters per token.
 CHARS_PER_TOKEN = 4
 
@@ -187,7 +202,10 @@ class Sandbox:
 class Policy:
     def __init__(self, path: Path) -> None:
         self.path = path
-        cfg = json.loads(path.read_text())
+        raw = path.read_bytes()
+        cfg = json.loads(raw)
+        # Which policy decided: every audit line names it.
+        self.version = hashlib.sha256(raw).hexdigest()[:12]
         base = path.parent
         self.listen: str = cfg.get("listen", "0.0.0.0:8080")
         self.advertise: str = cfg.get("advertise", "http://tether:8080")
@@ -532,39 +550,42 @@ class Ledger:
         max_inflight: int,
         cap_id: str | None = None,
         sub_cap: float | None = None,
-    ) -> tuple[Reservation | None, str | None]:
-        """Admit a call costing up to `est`, or say why not. Checked and held
+    ) -> tuple[Reservation | None, str | None, str]:
+        """Admit a call costing up to `est`, or say why not and which limit
+        (the audit's `rule`). Checked and held
         under one lock, so concurrent calls can't all fit in the same gap:
         overshoot is bounded by what a call costs beyond its own estimate."""
         with self.lock:
             self._roll()
             n = self.inflight.get(session, 0)
             if n >= max_inflight:
-                return None, f"{n} calls already in flight for session {session} (max_inflight {max_inflight})"
-            checks: list[tuple[str, str, float, float, float]] = []
+                why = f"{n} calls already in flight for session {session} (max_inflight {max_inflight})"
+                return None, why, "spend:max-inflight"
+            checks: list[tuple[str, str, str, float, float, float]] = []
             if session_cap is not None:
                 spent, held = self.spent.get(session, 0.0), self.held.get(session, 0.0)
-                checks.append(("cap", f"session {session}", spent, held, session_cap))
+                checks.append(("cap", "spend:session", f"session {session}", spent, held, session_cap))
             if team_cap is not None:
                 team, team_held = sum(self.spent.values()), sum(self.held.values())
-                checks.append(("cap", "the team", team, team_held, team_cap))
+                checks.append(("cap", "spend:team", "the team", team, team_held, team_cap))
             if cap_id is not None and sub_cap is not None:
                 spent, held = self.cap_spent.get(cap_id, 0.0), self.cap_held.get(cap_id, 0.0)
-                checks.append(("sub-cap", f"capability {cap_id}", spent, held, sub_cap))
-            for kind, whom, spent, held, limit in checks:
+                checks.append(("sub-cap", "spend:sub-cap", f"capability {cap_id}", spent, held, sub_cap))
+            for kind, rule, whom, spent, held, limit in checks:
                 if spent >= limit:
-                    return None, f"daily spend {kind} reached for {whom} (${spent:.4f} of ${limit:.4f})"
+                    return None, f"daily spend {kind} reached for {whom} (${spent:.4f} of ${limit:.4f})", rule
                 if spent + held >= limit or spent + held + est > limit:
-                    return None, (
+                    why = (
                         f"daily spend {kind} for {whom} would be crossed (${spent:.4f} spent"
                         f" + ${held:.4f} reserved in flight + ${est:.4f} for this call > ${limit:.4f})"
                     )
+                    return None, why, rule
             r = Reservation(session, cap_id if sub_cap is not None else None, est)
             self.inflight[session] = n + 1
             self.held[session] = self.held.get(session, 0.0) + est
             if r.cap_id:
                 self.cap_held[r.cap_id] = self.cap_held.get(r.cap_id, 0.0) + est
-            return r, None
+            return r, None, "spend:admit"
 
     def settle(self, r: Reservation, usd: float) -> None:
         """Replace a reservation with what the call cost. Idempotent."""
@@ -585,18 +606,76 @@ class Ledger:
             self.path.write_text(json.dumps({"day": self.day, "spent": self.spent, "caps": self.cap_spent}))
 
 
-class Audit:
-    """One JSON line per decision. Never headers, never bodies."""
+GENESIS = hashlib.sha256(b"").hexdigest()
 
-    def __init__(self, path: Path) -> None:
+
+def line_hash(line: str) -> str:
+    return hashlib.sha256(line.encode()).hexdigest()
+
+
+def last_line(path: Path) -> str | None:
+    """The last non-empty line of a file, read from the end."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            end = f.tell()
+            buf = b""
+            while end > 0:
+                step = min(65536, end)
+                end -= step
+                f.seek(end)
+                buf = f.read(step) + buf
+                lines = buf.rstrip(b"\n").split(b"\n")
+                if len(lines) > 1 or end == 0:
+                    return lines[-1].decode() if lines[-1] else None
+    except FileNotFoundError:
+        return None
+    return None
+
+
+def verify_chain(path: Path) -> tuple[int, str | None]:
+    """(lines checked, first broken link or None). Each line's `prev_hash` must be
+    the sha256 of the line before it (the first: sha256 of nothing)."""
+    prev = GENESIS
+    n = 0
+    with path.open() as f:
+        for n, raw in enumerate(f, 1):
+            line = raw.rstrip("\n")
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                return n, f"line {n}: not JSON"
+            if not isinstance(rec, dict) or "prev_hash" not in rec:
+                return n, f"line {n}: no prev_hash (written before the chain?)"
+            if rec["prev_hash"] != prev:
+                return n, f"line {n}: prev_hash {str(rec['prev_hash'])[:12]} does not match line {n - 1} ({prev[:12]})"
+            prev = line_hash(line)
+    return n, None
+
+
+class Audit:
+    """One JSON line per decision. Never headers, never bodies. Each line
+    carries `prev_hash`, the sha256 of the line before it, so an edit, a
+    deletion or a reorder breaks the chain at the next line (`tether audit
+    verify`). The last line has no successor to vouch for it: that is what
+    team mode's signed checkpoints are for. One writer per file: the chain
+    head is read once, at start."""
+
+    def __init__(self, path: Path, policy_version: str | None = None) -> None:
         self.path = path
+        self.policy_version = policy_version
         self.lock = threading.Lock()
+        last = last_line(path)
+        self.prev = line_hash(last) if last else GENESIS
 
     def write(self, **rec: Any) -> None:
         rec = {"ts": now_iso(), **{k: v for k, v in rec.items() if v is not None}}
-        line = json.dumps(rec, separators=(",", ":"))
+        if self.policy_version:
+            rec["policy_version"] = self.policy_version
         with self.lock, self.path.open("a") as f:
+            line = json.dumps({**rec, "prev_hash": self.prev}, separators=(",", ":"))
             f.write(line + "\n")
+            self.prev = line_hash(line)
         flag = "DENY " if rec.get("decision") == "deny" else "allow"
         what = rec.get("host") or f"{rec.get('method')} /{rec.get('route')}{rec.get('path', '')}"
         extra = f" ${rec['usd']:.4f}" if rec.get("usd") else ""
@@ -899,7 +978,7 @@ class Gateway:
         self.p = policy
         self.caps = Registry(policy.state_dir)
         self.ledger = Ledger(policy.state_dir / "spend.json")
-        self.audit = Audit(policy.state_dir / "audit.jsonl")
+        self.audit = Audit(policy.state_dir / "audit.jsonl", policy.version)
         self.cred_hosts = {r.host: name for name, r in policy.routes.items()}
 
     def identify(self, presented: list[str], sandbox: str) -> tuple[dict[str, Any] | None, Refusal | None]:
@@ -926,23 +1005,29 @@ class Gateway:
         return None, None
 
     def egress_ok(self, host: str, port: int, cap: dict[str, Any] | None = None) -> tuple[bool, str]:
-        """The ceiling (policy allowlist) first, then the cap's own grant: a
-        host must pass both."""
+        rule, why = self.egress_check(host, port, cap)
+        return why is None, why or ""
+
+    def egress_check(self, host: str, port: int, cap: dict[str, Any] | None = None) -> tuple[str, str | None]:
+        """(rule, refusal). The ceiling (policy allowlist) first, then the
+        cap's own grant: a host must pass both. The rule names the check
+        that decided, for the audit."""
         if port not in self.p.egress_ports:
-            return False, f"port {port} is not allowed"
+            return "egress:port", f"port {port} is not allowed"
         if host in self.cred_hosts:
-            return False, f"credentialed host; use the gateway route /{self.cred_hosts[host]}/"
+            return "egress:credentialed-host", f"credentialed host; use the gateway route /{self.cred_hosts[host]}/"
         try:
             ipaddress.ip_address(host.partition("%")[0])
-            return False, "IP literal; CONNECT by name"
+            return "egress:ip-literal", "IP literal; CONNECT by name"
         except ValueError:
             pass
-        if not any(fnmatch.fnmatchcase(host, pat) for pat in self.p.egress_allow):
-            return False, "host is not on the egress allowlist"
+        hit = next((i for i, pat in enumerate(self.p.egress_allow) if fnmatch.fnmatchcase(host, pat)), None)
+        if hit is None:
+            return "egress:allowlist", "host is not on the egress allowlist"
         grant = cap.get("egress") if cap else None
         if grant is not None and not any(fnmatch.fnmatchcase(host, pat) for pat in grant):
-            return False, f"host is not in capability {cap['cap_id']}'s egress grant"
-        return True, ""
+            return "cap:egress-grant", f"host is not in capability {cap['cap_id']}'s egress grant"
+        return f"egress:allow[{hit}]", None
 
     def resolve(self, host: str, port: int) -> tuple[list[str], str | None]:
         """Resolve on the host, once. (addresses, refusal): if any address is
@@ -961,7 +1046,7 @@ class Gateway:
             return f"route {route} not granted to capability {cap['cap_id']}"
         return None
 
-    def admit(self, cap: dict[str, Any], est: float) -> tuple[Reservation | None, str | None]:
+    def admit(self, cap: dict[str, Any], est: float) -> tuple[Reservation | None, str | None, str]:
         """Reserve `est` against the session, the team and the cap's sub-cap."""
         return self.ledger.reserve(
             cap["session"],
@@ -992,6 +1077,35 @@ def presented_tokens(headers: dict[str, str]) -> list[str]:
         else:
             out.append(v.strip())
     return out
+
+
+def clean_id(v: str | None) -> str | None:
+    return v if v and ID_RE.fullmatch(v) else None
+
+
+def client_ids(headers: dict[str, str]) -> dict[str, str | None]:
+    """The client-sent request and session IDs an audit line keeps."""
+    return {field: clean_id(headers.get(h)) for h, field in CLIENT_ID_HEADERS.items()}
+
+
+def upstream_id(get: Callable[[str], str | None]) -> str | None:
+    for h in UPSTREAM_ID_HEADERS:
+        v = clean_id(get(h))
+        if v:
+            return v
+    return None
+
+
+def head_header(head: bytes, name: str) -> str | None:
+    for line in head.decode("latin-1").split("\r\n")[1:]:
+        k, sep, v = line.partition(":")
+        if sep and k.strip().lower() == name:
+            return v.strip()
+    return None
+
+
+def new_request_id() -> str:
+    return "req_" + secrets.token_hex(8)
 
 
 def who(cap: dict[str, Any] | None) -> dict[str, Any]:
@@ -1095,8 +1209,24 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
         server_version = "tether"
         sys_version = ""
 
+        rid = ""
+
         def log_message(self, fmt: str, *args: Any) -> None:
             pass
+
+        def parse_request(self) -> bool:
+            # One ID per request: on the guest's response, every audit line
+            # for it, and nowhere upstream.
+            self.rid = new_request_id()
+            return super().parse_request()
+
+        def send_response(self, code: int, message: str | None = None) -> None:
+            super().send_response(code, message)
+            if self.rid:
+                self.send_header("x-tether-request-id", self.rid)
+
+        def _audit(self, **rec: Any) -> None:
+            gw.audit.write(request_id=self.rid, **rec)
 
         def _hdrs(self) -> dict[str, str]:
             return {k.lower(): v for k, v in self.headers.items()}
@@ -1125,18 +1255,18 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 return
             rec: dict[str, Any] = {"kind": "egress", "sandbox": sandbox, **who(cap), "host": f"{host}:{port}"}
             if refusal:
-                gw.audit.write(decision="deny", reason=refusal[0], **rec)
+                self._audit(decision="deny", rule="cap:identify", reason=refusal[0], **rec)
                 self._error(403, "permission_error", refusal[1])
                 return
-            ok, why = gw.egress_ok(host, port, cap)
-            if not ok:
-                gw.audit.write(decision="deny", reason=why, **rec)
+            rule, why = gw.egress_check(host, port, cap)
+            if why:
+                self._audit(decision="deny", rule=rule, reason=why, **rec)
                 self._error(403, "permission_error", f"{host}:{port} refused: {why}")
                 return
             # Egress costs a capability like everything else: otherwise any
             # process on the box gets out, and nothing says who it was.
             if cap is None:
-                gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
+                self._audit(decision="deny", rule="cap:missing", reason="bad or missing session capability", **rec)
                 self._error(
                     407,
                     "authentication_error",
@@ -1149,11 +1279,11 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             try:
                 addrs, why = gw.resolve(host, port)
             except OSError as e:
-                gw.audit.write(decision="allow", status=502, reason=f"resolve failed: {e}", **rec)
+                self._audit(decision="allow", status=502, rule=rule, reason=f"resolve failed: {e}", **rec)
                 self._error(502, "api_error", f"could not resolve {host}")
                 return
             if why:
-                gw.audit.write(decision="deny", reason=why, addrs=addrs, **rec)
+                self._audit(decision="deny", rule="addr", reason=why, addrs=addrs, **rec)
                 self._error(403, "permission_error", f"{host}:{port} refused: {why}")
                 return
             up, err = None, ""
@@ -1165,7 +1295,9 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 except OSError as e:
                     err = str(e)
             if up is None:
-                gw.audit.write(decision="allow", status=502, reason=f"connect failed: {err}", addrs=addrs, **rec)
+                self._audit(
+                    decision="allow", status=502, rule=rule, reason=f"connect failed: {err}", addrs=addrs, **rec
+                )
                 self._error(502, "api_error", f"could not reach {host}:{port}")
                 return
             self.send_response(200, "Connection Established")
@@ -1186,7 +1318,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 why = f"ClientHello refused: {e}"
             if why:
                 up.close()
-                gw.audit.write(decision="deny", reason=why, **rec)
+                self._audit(decision="deny", rule="sni", reason=why, **rec)
                 return
             try:
                 up.sendall(raw)
@@ -1194,7 +1326,9 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             finally:
                 up.close()
             ms = int((time.monotonic() - t0) * 1000)
-            gw.audit.write(decision="allow", bytes_up=up_bytes + len(raw), bytes_down=down_bytes, ms=ms, **rec)
+            self._audit(
+                decision="allow", rule=rule, bytes_up=up_bytes + len(raw), bytes_down=down_bytes, ms=ms, **rec
+            )
 
         # ---- credentialed routes: /<route>/<path>
         def _proxy(self) -> None:
@@ -1203,12 +1337,13 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             cap, refusal = gw.identify(presented_tokens(hdrs), sandbox)
             if self.path.startswith(("http://", "https://")):
                 host = urllib.parse.urlsplit(self.path).hostname
-                gw.audit.write(
+                self._audit(
                     kind="egress",
                     decision="deny",
                     sandbox=sandbox,
                     **who(cap),
                     host=f"{host}:80",
+                    rule="plain-http",
                     reason="plain-http forwarding is not offered",
                 )
                 self._error(403, "permission_error", "plain-http forwarding is not offered")
@@ -1229,27 +1364,29 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 "path": rest,
                 "sandbox": sandbox,
                 **who(cap),
+                **client_ids(hdrs),
             }
             if route is None:
-                gw.audit.write(decision="deny", reason="no such route", **rec)
+                self._audit(decision="deny", rule="route:none", reason="no such route", **rec)
                 self._error(404, "not_found_error", f"no route /{name}/")
                 return
             if not route.allowed(rest):
-                gw.audit.write(decision="deny", reason="path is not on the route's allowlist", **rec)
+                why = "path is not on the route's allowlist"
+                self._audit(decision="deny", rule=f"route:{name}:path", reason=why, **rec)
                 self._error(403, "permission_error", f"{rest} is not allowed on /{name}/")
                 return
             if refusal:
-                gw.audit.write(decision="deny", reason=refusal[0], **rec)
+                self._audit(decision="deny", rule="cap:identify", reason=refusal[0], **rec)
                 self._error(403, "permission_error", refusal[1])
                 return
             if cap is None:
-                gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
+                self._audit(decision="deny", rule="cap:missing", reason="bad or missing session capability", **rec)
                 extra = {"WWW-Authenticate": 'Basic realm="tether"'} if route.inject.startswith("basic:") else None
                 self._error(401, "authentication_error", "bad or missing session capability", extra)
                 return
             not_granted = gw.route_ok(cap, name)
             if not_granted:
-                gw.audit.write(decision="deny", reason=not_granted, **rec)
+                self._audit(decision="deny", rule="cap:route-grant", reason=not_granted, **rec)
                 self._error(403, "permission_error", f"route /{name}/ is not granted to this capability")
                 return
             target = route.upstream.path.rstrip("/") + rest + (f"?{query}" if query else "")
@@ -1258,31 +1395,35 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 # The meter reads usage out of HTTP bodies; it can't parse
                 # WebSocket frames, so an upgrade would step around the cap.
                 if route.meter:
-                    gw.audit.write(decision="deny", reason="upgrade is not offered on a metered route", **rec)
+                    why = "upgrade is not offered on a metered route"
+                    self._audit(decision="deny", rule="route:metered-upgrade", reason=why, **rec)
                     self._error(403, "permission_error", f"upgrade is not offered on metered route /{name}/")
                     return
                 if self.headers.get("transfer-encoding") or self.headers.get("content-length", "0").strip() != "0":
-                    gw.audit.write(decision="deny", reason="upgrade with a request body", **rec)
+                    self._audit(decision="deny", rule="upgrade:body", reason="upgrade with a request body", **rec)
                     self._error(400, "invalid_request_error", "upgrade with a request body is not supported")
                     return
+                rec["rule"] = f"route:{name}"
                 self._upgrade(route, target, hdrs, proto, rec, t0)
                 return
             try:
                 body = RequestBody(self.rfile, self.headers, self.connection, buffer=route.meter)
             except BodyError as e:
-                gw.audit.write(decision="deny", reason=str(e), **rec)
+                self._audit(decision="deny", rule="body", reason=str(e), **rec)
                 self._error(400, "invalid_request_error", str(e))
                 return
             res = None
             if route.meter:
                 est = reserve_usd(gw.p.prices, body.data)
-                res, blocked = gw.admit(cap, est)
+                res, blocked, spend_rule = gw.admit(cap, est)
                 if blocked:
-                    gw.audit.write(decision="deny", reason=blocked, reserve_usd=round(est, 6), **rec)
+                    est_usd = round(est, 6)
+                    self._audit(decision="deny", rule=spend_rule, reason=blocked, reserve_usd=est_usd, **rec)
                     # 403, not 429: a 429 is an invitation to retry.
                     self._error(403, "permission_error", blocked)
                     return
                 rec["reserve_usd"] = round(est, 6)
+            rec["rule"] = f"route:{name}"
             try:
                 self._forward(route, target, hdrs, body, rec, t0, res)
             finally:
@@ -1312,16 +1453,17 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             try:
                 conn.request(self.command, target, body=body.upload(), headers=fwd, encode_chunked=body.chunked)
                 resp = conn.getresponse()
+                rec["upstream_request_id"] = upstream_id(resp.getheader)
             except BodyError as e:
                 # The client stopped mid-body: the upstream got a truncated
                 # request, and there is nothing sane to answer.
                 conn.close()
-                gw.audit.write(decision="allow", status=499, reason=str(e), bytes_up=body.sent, **rec)
+                self._audit(decision="allow", status=499, reason=str(e), bytes_up=body.sent, **rec)
                 self.close_connection = True
                 return
             except OSError as e:
                 conn.close()
-                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", bytes_up=body.sent, **rec)
+                self._audit(decision="allow", status=502, reason=f"upstream error: {e}", bytes_up=body.sent, **rec)
                 self._error(502, "api_error", "upstream error")
                 return
 
@@ -1369,7 +1511,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     usd = round(usd, 6)
                     gw.ledger.settle(res, usd)
                     rec.update(model=meter.model or None, tokens=meter.usage or None)
-                gw.audit.write(
+                self._audit(
                     decision="allow",
                     status=resp.status,
                     usd=usd,
@@ -1401,7 +1543,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 if tls:
                     up = ssl.create_default_context().wrap_socket(up, server_hostname=host)
             except OSError as e:
-                gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                self._audit(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
                 self._error(502, "api_error", "upstream error")
                 return
             try:
@@ -1409,8 +1551,9 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     up.sendall(head.encode("latin-1") + b"\r\n")
                     resp_head, extra = read_head(up)
                     status = int(resp_head.split(b"\r\n", 1)[0].split()[1])
+                    rec["upstream_request_id"] = upstream_id(lambda h: head_header(resp_head, h))
                 except (OSError, ValueError, IndexError) as e:
-                    gw.audit.write(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
+                    self._audit(decision="allow", status=502, reason=f"upstream error: {e}", **rec)
                     self._error(502, "api_error", "upstream error")
                     return
                 if status == 101:
@@ -1420,7 +1563,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     if early:
                         up.sendall(early)
                     up_bytes, down_bytes = pump(self.connection, up)
-                    gw.audit.write(
+                    self._audit(
                         decision="allow",
                         status=101,
                         bytes_up=len(early) + up_bytes,
@@ -1445,7 +1588,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                     self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
                 self.wfile.write(b"0\r\n\r\n")
                 self.wfile.flush()
-                gw.audit.write(
+                self._audit(
                     decision="allow",
                     status=resp.status,
                     reason="upstream refused the upgrade",
@@ -1637,6 +1780,18 @@ def cmd_report(policy: Policy, as_json: bool) -> None:
             print(f"  {n:>4}  {h}")
 
 
+def cmd_audit_verify(policy: Policy) -> None:
+    f = policy.state_dir / "audit.jsonl"
+    if not f.exists():
+        print("no audit log yet")
+        return
+    n, broken = verify_chain(f)
+    if broken:
+        print(f"{f}: chain broken at {broken}", file=sys.stderr)
+        sys.exit(1)
+    print(f"{f}: {n} lines, chain intact")
+
+
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="tether", description=__doc__.split("\n\n")[0])
     ap.add_argument("-c", "--config", default="policy.json", type=Path)
@@ -1645,6 +1800,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("serve", help="run the gateway")
     rp = sub.add_parser("report", help="spend and denials per session")
     rp.add_argument("--json", action="store_true")
+    ap_audit = sub.add_parser("audit", help="check the audit log")
+    ap_audit.add_argument("audit_cmd", choices=["verify"], help="verify: walk the hash chain, report the first break")
     cp = sub.add_parser("cap", help="mint, revoke and list capabilities")
     csub = cp.add_subparsers(dest="cap_cmd", required=True)
     m = csub.add_parser("mint", help="mint a cap; prints it (or writes --env) once")
@@ -1675,6 +1832,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_serve(policy)
     elif args.cmd == "cap":
         cmd_cap(policy, args)
+    elif args.cmd == "audit":
+        cmd_audit_verify(policy)
     else:
         cmd_report(policy, args.json)
 

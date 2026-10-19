@@ -73,6 +73,8 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
             ctype = "application/json"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
+        self.send_header("request-id", "req_upstream_123")
+        self.send_header("x-tether-request-id", "spoofed-by-upstream")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
@@ -81,6 +83,7 @@ class FakeUpstream(http.server.BaseHTTPRequestHandler):
         FakeUpstream.seen.append({"path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}})
         out = b"001e# service=git-upload-pack\n0000"
         self.send_response(200)
+        self.send_header("x-github-request-id", "C0FF:EE:1234")
         self.send_header("Content-Length", str(len(out)))
         self.end_headers()
         self.wfile.write(out)
@@ -805,6 +808,126 @@ class TetherTest(unittest.TestCase):
         self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
         self.assertEqual(self.audit()[-1]["sandbox"], "default")
 
+    # --- audit: request ids, rules, hash chain
+
+    def test_request_id_on_responses_and_audit_lines(self) -> None:
+        cap = self.caps["alice"]
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        client = {
+            "Authorization": "Bearer " + cap,
+            "X-Claude-Code-Session-Id": "0b5e-sess-1",
+            "x-client-request-id": "cli-req-9",
+            "x-claude-code-agent-id": "has spaces; not an id",
+        }
+        c.request("POST", "/anthropic/v1/messages", json.dumps({"stream": True}), client)
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 200)
+        rid = r.getheader("x-tether-request-id") or ""
+        self.assertRegex(rid, r"^req_[0-9a-f]{16}$")
+        self.assertEqual(r.msg.get_all("x-tether-request-id"), [rid])  # the upstream's copy is dropped
+        self.assertNotIn("x-tether-request-id", FakeUpstream.seen[-1]["headers"])
+        rec = self.audit()[-1]
+        self.assertEqual(rec["request_id"], rid)
+        self.assertEqual(rec["upstream_request_id"], "req_upstream_123")
+        self.assertEqual(rec["rule"], "route:anthropic")
+        self.assertEqual(rec["policy_version"], self.policy.version)
+        self.assertEqual((rec["client_session_id"], rec["client_request_id"]), ("0b5e-sess-1", "cli-req-9"))
+        self.assertNotIn("client_agent_id", rec)
+        self.assertNotIn("headers", rec)
+
+        # a refusal
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request("POST", "/anthropic/v1/organizations/me", "{}", {"Authorization": "Bearer " + cap})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(r.status, 403)
+        rec = self.audit()[-1]
+        self.assertEqual(rec["request_id"], r.getheader("x-tether-request-id"))
+        self.assertEqual(rec["rule"], "route:anthropic:path")
+
+        # git: the GitHub request id
+        auth = base64.b64encode(f"agent:{self.caps['bob']}".encode()).decode()
+        c = http.client.HTTPConnection("127.0.0.1", self.port)
+        c.request("GET", "/github/acme/app.git/info/refs", headers={"Authorization": "Basic " + auth})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        self.assertEqual(self.audit()[-1]["upstream_request_id"], "C0FF:EE:1234")
+
+        # CONNECT: refused, then allowed
+        head, s = self.connect("evil.example:443", cap)
+        s.close()
+        rid = head.split(b"x-tether-request-id: ", 1)[1].split(b"\r\n", 1)[0].decode()
+        rec = self.audit()[-1]
+        self.assertEqual((rec["request_id"], rec["rule"]), (rid, "egress:allowlist"))
+        head, s = self.connect(f"localhost:{self.echo_port}", cap)
+        self.assertIn(b"200", head.split(b"\r\n")[0])
+        rid = head.split(b"x-tether-request-id: ", 1)[1].split(b"\r\n", 1)[0].decode()
+        s.sendall(tls_hello("localhost"))
+        s.settimeout(5)
+        s.recv(65536)
+        s.close()
+        rec = self.wait_audit(5)[-1]
+        self.assertEqual((rec["request_id"], rec["rule"], rec["decision"]), (rid, "egress:allow[0]", "allow"))
+        self.assertEqual(len({x["request_id"] for x in self.audit()}), 5)
+
+    def test_audit_chain_verifies_and_breaks_at_an_edit(self) -> None:
+        h = {"Authorization": "Bearer " + self.caps["alice"]}
+        self.post("/anthropic/v1/messages", {}, h)  # $3, over the $1 cap
+        st, _ = self.post("/anthropic/v1/messages", {}, h)
+        self.assertEqual(st, 403)
+        self.assertEqual(self.audit()[-1]["rule"], "spend:session")
+        self.connect("evil.example:443")[1].close()
+        self.post("/openai/v1/responses", {}, h)
+        f = self.policy.state_dir / "audit.jsonl"
+        self.assertEqual(tether.verify_chain(f), (4, None))
+        lines = f.read_text().splitlines()
+        self.assertEqual(json.loads(lines[0])["prev_hash"], hashlib.sha256(b"").hexdigest())
+        cfg = ["-c", str(self.policy.path), "audit", "verify"]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            tether.main(cfg)
+        self.assertIn("4 lines, chain intact", out.getvalue())
+
+        # quietly lower what line 1 cost: line 2's link no longer matches
+        rec = json.loads(lines[0])
+        rec["usd"] = 0.01
+        edited = [json.dumps(rec, separators=(",", ":"))] + lines[1:]
+        f.write_text("\n".join(edited) + "\n")
+        n, broken = tether.verify_chain(f)
+        self.assertEqual(n, 2)
+        self.assertIn("does not match line 1", broken or "")
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as ex:
+            tether.main(cfg)
+        self.assertEqual(ex.exception.code, 1)
+        self.assertIn("chain broken at line 2", err.getvalue())
+
+        # deleting a line breaks it too
+        f.write_text("\n".join(lines[:1] + lines[2:]) + "\n")
+        self.assertEqual(tether.verify_chain(f)[0], 2)
+
+    def test_restart_continues_the_chain(self) -> None:
+        self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
+        f = self.policy.state_dir / "audit.jsonl"
+        last = f.read_text().splitlines()[-1]
+        _, gw2 = tether.build_servers(self.policy)  # a second process start reads the tail
+        self.assertEqual(gw2.audit.prev, hashlib.sha256(last.encode()).hexdigest())
+        gw2.audit.write(kind="egress", decision="deny", host="x:443")
+        self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
+        # two writers on one file would fork the chain: the old gateway's
+        # next line links to its own last line, not gw2's
+        self.assertEqual(tether.verify_chain(f)[0], 3)
+        f.write_text("\n".join(f.read_text().splitlines()[:2]) + "\n")
+        self.assertEqual(tether.verify_chain(f), (2, None))
+
+    def test_policy_version_tracks_the_file(self) -> None:
+        v = self.policy.version
+        self.assertRegex(v, r"^[0-9a-f]{12}$")
+        self.policy.path.write_text(self.policy.path.read_text() + " ")
+        self.assertNotEqual(tether.Policy(self.policy.path).version, v)
+
     def test_report_runs(self) -> None:
         self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
         self.connect("evil.example:443")[1].close()
@@ -1264,7 +1387,7 @@ class ReservationTest(TwoSandboxes):
 
     def test_settle_is_idempotent(self) -> None:
         led = self.ledger()
-        r, why = led.reserve("o1", 0.5, 1.0, None, 4)
+        r, why, _ = led.reserve("o1", 0.5, 1.0, None, 4)
         self.assertIsNone(why)
         assert r is not None
         led.settle(r, 0.1)

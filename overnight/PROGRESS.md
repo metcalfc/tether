@@ -6,32 +6,21 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 9: **hash-chained audit with the new fields and
-`x-tether-request-id`** (design "Changes from today's leash" item 8, and
-"Request flow" step 6). Today `Audit.write` appends plain JSON lines with
-`sandbox`, `session`, `agent`, `tool`, `human`, `cap_id` (and
-`reserve_usd`/`aborted` since run 14). Add: a per-request `request_id`
-(e.g. `req_` + 16 hex) minted at the start of each handler and returned to
-the guest as the `x-tether-request-id` response header on every route
-response *and* on refusals (`_error`) and CONNECT replies;
-`upstream_request_id` from the upstream's `request-id` (Anthropic) or
-`x-github-request-id` header; `policy_version` (sha256 of the policy file
-bytes, first 12 hex, computed at load); `rule` (which check decided: e.g.
-`route:anthropic`, `egress:allow[2]`, `cap:route-grant`, `spend:sub-cap`,
-`addr`, `sni`); and the client-sent Claude Code IDs
-(`x-claude-code-session-id` if present; check what 2.1.303 actually sends
-before naming it -- the audit must never carry headers wholesale). Chain
-with `prev_hash` = sha256 of the previous line's bytes (first line:
-sha256 of "" or a genesis marker), computed under the existing lock; on
-start, read the last line of an existing audit.jsonl to continue the chain.
-Add `tether audit verify` that walks the file and reports the first broken
-link. Signed checkpoints over OTLP/HTTPS are team-mode: out of scope
-tonight, record that. Unit tests: request id header on a 200, a 403 and a
-CONNECT; ids match audit lines; chain verifies; editing one line breaks
-verify at that line; restart continues the chain; `upstream_request_id`
-captured from the fake upstream. Then a real run (cage gateway or a local
-serve with a haiku call) to see `request-id` from api.anthropic.com land in
-the audit.
+Milestone 3–4 is done (all 10 items). **Start milestone 5 (identity in the
+guest), item 1: per-agent Unix users and a shared `/work`.** Re-read the
+design first: "nono: capabilities inside the guest" (items 1-5), the
+"Policy model" section, and the plan row for milestone 5. Then, in the cage
+(`spike/msb/cage.sh`, Landlock kernel via `MSB_LIBKRUNFW_PATH`, tether as
+the gateway as in run 11): create one Unix user per agent (e.g. `claude`,
+`codex`) and a group `work`; `/work` owned by `root:work`, mode 2775
+(setgid), with default ACLs (`setfacl -d -m g:work:rwX`). First check
+whether `setfacl` exists in `node:22-bookworm`. If it doesn't, the guest
+can't `apt install acl` unless deb.debian.org is on the egress allowlist:
+either allow it for the setup step or fall back to setgid plus `umask 002`,
+and record which. Verify: each user can create files in `/work` that the
+other can edit; neither can read the other's home; root-owned `/run/tether`
+is not readable by them. Script it in `cage.sh` (e.g. `cage.sh users`) and
+record what you ran.
 
 ## 0. Setup
 
@@ -282,8 +271,8 @@ Run 6 (2026-10-18) notes:
 - [x] Streamed request bodies (large `git push`)
 - [x] `Upgrade` passthrough on routes
 - [x] Spend reservations and a max-inflight limit; non-retryable refusal
-- [ ] Hash-chained audit with the new fields and `x-tether-request-id`
-- [ ] Unit tests for each item; all tests pass
+- [x] Hash-chained audit with the new fields and `x-tether-request-id`
+- [x] Unit tests for each item; all tests pass
 
 Run 7 (2026-10-18) notes:
 
@@ -508,34 +497,6 @@ Run 12 (2026-10-19) notes:
   no `stream-test` branch.
 - No model calls this run.
 
-## 5. Identity in the guest
-
-- [ ] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
-- [ ] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
-- [ ] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
-
-## 6. Compiler and conformance
-
-- [ ] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
-- [ ] `tether report --by tool`
-- [ ] Claude Code conformance: betas forwarded, SSE pings, `count_tokens`, error bodies, `HEAD /api/hello`, `skipWebFetchPreflight`
-
-## 7. Adversarial suite
-
-- [ ] Injected README (paste site, push to another org)
-- [ ] Malicious npm package fixture (postinstall)
-- [ ] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
-- [ ] Capability replayed from a second sandbox gets a 403
-- [ ] Four concurrent streams against the cap; record the overshoot
-
-## 8. Demo and write-up
-
-- [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
-- [ ] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
-- [ ] `overnight/REPORT.md` written
-- [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
-- [ ] `DONE` written to `overnight/STATUS`
-
 Run 13 (2026-10-19) notes:
 
 - **`Upgrade` passthrough:** `_proxy` checks `wants_upgrade(hdrs)`
@@ -646,6 +607,97 @@ Run 14 (2026-10-19) notes:
   it in the four-stream test.
 - The `$%.4f` in refusal messages shows a $0.00002 cap as $0.0000; cosmetic.
 
+Run 15 (2026-10-19) notes:
+
+- **Request id:** `Handler.parse_request` mints `req_` + 16 hex per
+  request; `send_response` adds `x-tether-request-id` to **every** response
+  the guest gets: route responses, refusals (`_error`), the CONNECT 200, and
+  stdlib `send_error`s. `x-tether-request-id` is in `HOP`, so a copy from the
+  upstream is dropped and the guest's copy never goes upstream. Every audit
+  write in the handler goes through `self._audit`, which adds `request_id`.
+- **New audit fields:** `request_id`; `policy_version` (sha256 of the policy
+  file bytes, first 12 hex, `Policy.version`, added by `Audit`);
+  `upstream_request_id` (first of `request-id`, `x-request-id`,
+  `x-github-request-id`; also on refused upgrades and 101s); `rule`; and
+  client IDs from a **fixed allowlist** of headers, kept only if they match
+  `[A-Za-z0-9._:-]{1,128}`: `x-claude-code-session-id` -> `client_session_id`,
+  `x-claude-code-agent-id`, `x-claude-code-parent-agent-id`,
+  `x-claude-code-prompt-id`, `x-client-request-id`. Names checked with
+  `strings` on the 2.1.303 binary (`~/.local/share/claude/versions/2.1.303`),
+  which has `X-Claude-Code-Session-Id`, `x-claude-code-agent-id`,
+  `x-claude-code-parent-agent-id`, `x-claude-code-prompt-id` and
+  `x-client-request-id`. **Not yet seen on the wire from Claude Code**:
+  confirm `client_session_id` on the first Claude Code audit line in
+  milestone 6/7 (conformance).
+- **Rules** (which check decided): `cap:identify`, `cap:missing`,
+  `cap:route-grant`, `cap:egress-grant`, `route:none`, `route:<r>:path`,
+  `route:metered-upgrade`, `upgrade:body`, `body`, `plain-http`,
+  `egress:port`, `egress:credentialed-host`, `egress:ip-literal`,
+  `egress:allowlist`, `addr`, `sni`, `spend:max-inflight`, `spend:session`,
+  `spend:team`, `spend:sub-cap`; allows: `route:<r>`, `egress:allow[i]` (index
+  into `egress.allow`). New `Gateway.egress_check` returns (rule, refusal);
+  `egress_ok` wraps it. `Ledger.reserve` and `Gateway.admit` now return
+  `(res, why, rule)`.
+- **Chain:** each line ends with `prev_hash` = sha256 of the previous line's
+  bytes (no newline); the first line's is sha256("") (`e3b0c4...`). Computed
+  under the audit lock. `Audit.__init__` reads the file's last line from the
+  end (`last_line`) to continue the chain after a restart. `tether -c P audit
+  verify` walks it (`verify_chain`) and exits 1 at the first break: an edit
+  to line k shows at line k+1 ("prev_hash ... does not match line k").
+  **Limits, recorded:** an edit to the *last* line is undetectable without a
+  checkpoint, and there must be one writer per audit file (the head is read
+  once at start; a second `serve` on the same state dir forks the chain,
+  which verify then reports). **Signed checkpoints over OTLP/HTTPS are team
+  mode: out of scope tonight.**
+- **Tests** (4 new in `TetherTest`; fake upstream now sends `request-id`,
+  `x-github-request-id` and a spoofed `x-tether-request-id`): request id on
+  a 200, a 403 and on CONNECT refused/200, each matching its audit line, one
+  `x-tether-request-id` only, none upstream; `upstream_request_id` from both
+  fakes; client ids kept, a malformed one dropped; rules
+  `route:anthropic`, `route:anthropic:path`, `egress:allowlist`,
+  `egress:allow[0]`, `spend:session`; chain verifies (lib and CLI), an edit to
+  line 1 breaks at line 2 (CLI exit 1), a deletion breaks; restart continues
+  the chain; `policy_version` changes with the file. `make test`: **72 tests
+  OK** (leash 14 unchanged, tether 58). ruff clean.
+- **Real run** (`overnight/run/au/real.sh`, live `tether serve` on
+  127.0.0.1:18141, real upstreams): haiku call 200 with `x-tether-request-id
+  req_743c...`, audit `upstream_request_id req_011CgBDACij7D1XNbZuwMjTB`
+  (Anthropic's `request-id`) and `client_session_id` from the header; GitHub
+  info/refs 200 with `upstream_request_id D67B:2DE5B6:...`
+  (`x-github-request-id`); off-allowlist path 403 `route:github:path`;
+  CONNECT pypi.org `egress:allow[0]`, example.com `egress:allowlist`; all 6
+  lines carry `policy_version 312323e06bc2`; `audit verify`: 6 lines, intact.
+  Editing line 2's `usd` by hand: `chain broken at line 3`, exit 1.
+- Spend this run: 2 haiku calls (max_tokens 5), **$0.000066**.
+
+## 5. Identity in the guest
+
+- [ ] Per-agent Unix users; shared `/work` (group, setgid, default ACLs)
+- [ ] nono session profile per agent; command policies for git and npm; capability delivery via tmpfs
+- [ ] Verify one tool can't read another's capability (`/proc/<pid>/environ`)
+
+## 6. Compiler and conformance
+
+- [ ] `tether compile`: one policy file emits msb flags, nono profiles and tether config, with subset checks and wildcard lints
+- [ ] `tether report --by tool`
+- [ ] Claude Code conformance: betas forwarded, SSE pings, `count_tokens`, error bodies, `HEAD /api/hello`, `skipWebFetchPreflight`
+
+## 7. Adversarial suite
+
+- [ ] Injected README (paste site, push to another org)
+- [ ] Malicious npm package fixture (postinstall)
+- [ ] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
+- [ ] Capability replayed from a second sandbox gets a 403
+- [ ] Four concurrent streams against the cap; record the overshoot
+
+## 8. Demo and write-up
+
+- [ ] `spike/RESULTS.md` has a PoC section with every success criterion and measurement
+- [ ] Demo recorded to `overnight/run/poc-demo.mp4` (or `overnight/DEMO.md`)
+- [ ] `overnight/REPORT.md` written
+- [ ] The real-key `git grep` from PROMPT.md is clean; branch pushed; draft PR opened
+- [ ] `DONE` written to `overnight/STATUS`
+
 ## Spend log
 
 | Run | Model calls | USD (from tether report) |
@@ -655,6 +707,7 @@ Run 14 (2026-10-19) notes:
 | 10 | 2 (haiku, via tether, max_tokens 5) | $0.000066 |
 | 11 | 1 (haiku, Claude Code via tether, works.sh) | $0.0374 |
 | 14 | 3 allowed + 4 refused at admission (haiku, via tether, streaming) | $0.005063 |
+| 15 | 2 (haiku, via tether, max_tokens 5) | $0.000066 |
 
 ## Decisions and corrections
 
