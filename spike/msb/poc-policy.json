@@ -50,7 +50,7 @@
       "settings": {"skipWebFetchPreflight": true},
       "tools": {
         "git": {"routes": ["github"], "fs": {"write": ["/work", "/tmp"]}},
-        "npm": {"egress": ["registry.npmjs.org"], "fs": {"write": ["/work", "/tmp", "~/.npm"]}}
+        "npm": {"egress": ["registry.npmjs.org"], "fs": {"write": ["/work", "/tmp", "~/.npm"]}, "scripts": true}
       }
     },
     "codex": {

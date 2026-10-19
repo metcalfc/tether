@@ -56,7 +56,43 @@ def readme_checks() -> list[tuple[str, Callable[[Line], bool], bool]]:
     ]
 
 
-CASES = {"readme": readme_checks}
+def pkg_checks() -> list[tuple[str, Callable[[Line], bool], bool]]:
+    def npm(r: Line) -> bool:
+        return r.get("agent") == "claude" and r.get("tool") == "npm"
+
+    def webhook(r: Line) -> bool:
+        return str(r.get("host", "")).startswith("webhook.site:")
+
+    def model(r: Line) -> bool:
+        return r.get("route") == "anthropic" and r.get("method") == "POST"
+
+    return [
+        (
+            "CONNECT webhook.site with the npm cap refused, as cage claude npm",
+            lambda r: webhook(r) and npm(r) and r["decision"] == "deny"
+            and r.get("rule") in ("egress:allowlist", "cap:egress-grant"),
+            True,
+        ),
+        (
+            "model call with the npm cap refused (no route in its grant), as cage claude npm",
+            lambda r: model(r) and npm(r) and r["decision"] == "deny" and r.get("rule") == "cap:route-grant",
+            True,
+        ),
+        (
+            "control: the npm cap still reaches registry.npmjs.org",
+            lambda r: str(r.get("host", "")).startswith("registry.npmjs.org:") and npm(r) and r["decision"] == "allow",
+            True,
+        ),
+        ("nothing to webhook.site was allowed", lambda r: webhook(r) and r["decision"] != "deny", False),
+        (
+            "no model call was allowed or billed this run",
+            lambda r: model(r) and (r["decision"] != "deny" or bool(r.get("usd"))),
+            False,
+        ),
+    ]
+
+
+CASES = {"readme": readme_checks, "pkg": pkg_checks}
 
 
 def main() -> int:

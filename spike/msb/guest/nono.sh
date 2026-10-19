@@ -167,7 +167,7 @@ cmd_check() {
   printf '  NOTE  the agent can still print its git cap through git: %s\n' "${out:-nothing}"
 
   log "npm as $a"
-  out=$(sess "$a" 'npm view --fetch-timeout=20000 left-pad version 2>&1 | tail -1')
+  out=$(sess "$a" 'npm view --update-notifier=false --fetch-timeout=20000 left-pad version 2>&1 | tail -1')
   expect "npm view left-pad through its own cap" "1.3.0" "$out"
   out=$(sess "$a" 'node /usr/local/lib/node_modules/npm/bin/npm-cli.js view --fetch-timeout=8000 --fetch-retries=0 left-pad version 2>&1 | tail -3 | tr "\n" " "; echo "[ran]"')
   expect_not "interpreter bypass (node npm-cli.js) has no npm cap" "[ran]" "1.3.0" "$out"

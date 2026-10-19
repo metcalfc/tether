@@ -1692,6 +1692,43 @@ class CompileTest(unittest.TestCase):
         creds = prof["command_policies"]["credentials"]
         self.assertEqual(creds["npm-cap"], {"type": "raw-file", "path": "/run/tether/claude/npm"})
 
+    def test_npm_scripts_edge(self) -> None:
+        # Off by default: no sh edge, so npm's `sh -c` hits nono's exec gate.
+        for a in ("claude", "codex"):
+            cfg = json.loads(json.dumps(self.src))
+            cfg["agents"][a]["tools"]["npm"].pop("scripts", None)
+            out, lints = self.compile(cfg)
+            self.assertEqual(lints.errors, [])
+            cmds = out["nono"][a]["command_policies"]["commands"]
+            self.assertNotIn("sh", cmds)
+            self.assertNotIn("can_use", cmds["npm"])
+        cfg = json.loads(json.dumps(self.src))
+        cfg["agents"]["claude"]["tools"]["npm"]["scripts"] = True
+        out, lints = self.compile(cfg)
+        self.assertEqual(lints.errors, [])
+        cmds = out["nono"]["claude"]["command_policies"]["commands"]
+        self.assertEqual(cmds["npm"]["can_use"], ["sh"])
+        self.assertEqual(cmds["sh"]["executable"], "/bin/sh")
+        self.assertEqual(cmds["sh"]["from"]["session"], "deny")
+        box = cmds["sh"]["from"]["npm"]["sandbox"]
+        # npm's files, but no cap, no network, and no npm_config_* (its proxy vars hold the cap)
+        self.assertEqual(box["fs_write"], cmds["npm"]["sandbox"]["fs_write"])
+        self.assertNotIn("use_credentials", box)
+        self.assertNotIn("network", box)
+        env = box["environment"]["allow_vars"]
+        self.assertFalse([v for v in env if v.startswith("npm_config") or v in ("*", "npm_*")])
+        self.assertIn("npm_package_*", env)
+
+    def test_npm_scripts_lints(self) -> None:
+        def on_git(c: dict[str, Any]) -> None:
+            c["agents"]["claude"]["tools"]["git"]["scripts"] = True
+
+        def not_bool(c: dict[str, Any]) -> None:
+            c["agents"]["claude"]["tools"]["npm"]["scripts"] = "yes"
+
+        self.assertIn("only npm runs lifecycle scripts", self.errors(on_git))
+        self.assertIn("scripts: true or false", self.errors(not_bool))
+
     def test_compiled_config_loads_and_mints_by_grant(self) -> None:
         os.environ["T_ANTHROPIC"] = REAL_KEY
         os.environ["T_GH"] = GH_TOKEN

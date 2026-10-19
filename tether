@@ -1752,6 +1752,9 @@ GIT_ENV = BASE_ENV + [
     "GIT_CONFIG_PARAMETERS",
     "GIT_PROTOCOL",
 ]
+# What npm's lifecycle scripts keep. npm also exports npm_config_*, and
+# npm_config_https_proxy/npm_config_proxy carry the npm cap, so none of those.
+SCRIPT_ENV = BASE_ENV + ["PATH", "INIT_CWD", "npm_command", "npm_lifecycle_*", "npm_package_*"]
 # The tools the compiler knows how to sandbox, and the cap format each reads.
 # nono 0.80 cannot put a file in a tool's environment and a command sandbox
 # may exec only its pinned executable, so every cap is a file in the tool's
@@ -1765,7 +1768,7 @@ POLICY_KEYS = {
     "egress": {"deny_private", "ports", "allow_addresses"},
     "spend": {"prices", "session_usd_per_day", "total_usd_per_day", "max_inflight"},
     "agent": {"fs", "routes", "egress", "spend_usd", "settings", "tools"},
-    "tool": {"fs", "routes", "egress", "spend_usd", "argv_prepend"},
+    "tool": {"fs", "routes", "egress", "spend_usd", "argv_prepend", "scripts"},
     "fs": {"write", "write_file", "read", "deny"},
     "ceiling": {"routes", "egress", "spend"},
 }
@@ -1932,6 +1935,27 @@ def nono_profile(
             box["network"] = net
             box["environment"] = {"allow_vars": BASE_ENV}
             commands["npm"] = {"executable": "/usr/local/bin/node", "sandbox": box}
+            if spec.get("scripts"):
+                # Lifecycle scripts: npm spawns `sh -c SCRIPT`. Without this
+                # edge the exec gate refuses sh and the install fails closed.
+                # With it, sh runs with npm's files but no cap, no network and
+                # no npm_config_* (the cap rides in its proxy vars); anything
+                # the script execs is refused, so only shell builtins run.
+                # /bin/sh becomes policy-controlled: the session cannot run it.
+                commands["npm"]["can_use"] = ["sh"]
+                commands["sh"] = {
+                    "executable": "/bin/sh",
+                    "from": {
+                        "session": "deny",
+                        "npm": {
+                            "sandbox": {
+                                "fs_read": box["fs_read"],
+                                "fs_write": box["fs_write"],
+                                "environment": {"allow_vars": SCRIPT_ENV},
+                            }
+                        },
+                    },
+                }
     return {
         "meta": {"name": f"tether-{agent}", "description": f"tether session sandbox for agent {agent}"},
         "filesystem": {
@@ -2105,7 +2129,14 @@ def compile_policy(src: Path) -> tuple[dict[str, Any], Lints]:
             if not isinstance(argv, list) or not all(isinstance(x, str) for x in argv):
                 lints.errors.append(f"{tw}.argv_prepend: a list of strings")
                 argv = []
-            tools[t] = {"fs": tfs, "argv_prepend": argv}
+            scripts = tc.get("scripts", False)
+            if not isinstance(scripts, bool):
+                lints.errors.append(f"{tw}.scripts: true or false")
+                scripts = False
+            elif scripts and t != "npm":
+                lints.errors.append(f"{tw}.scripts: only npm runs lifecycle scripts")
+                scripts = False
+            tools[t] = {"fs": tfs, "argv_prepend": argv, "scripts": scripts}
             g["tools"][t] = {"routes": troutes, "egress": tegress, "spend_usd": tspend, "format": TOOL_FORMATS[t]}
             caps.append((a, t))
         grants[a] = g

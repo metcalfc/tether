@@ -32,7 +32,7 @@
 #   cage.sh adv CASE   milestone 7's adversarial cases (guest/adv.sh CASE as
 #                      guest root), then check tether's audit lines from
 #                      this run (advcheck.py); run `users` and `nono` first.
-#                      CASE: readme
+#                      CASE: readme, pkg
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -258,6 +258,7 @@ cmd_adv() {
   limit 600 "$MSB" exec "$NAME" --no-stdin -- env AGENTS="$CAGE_AGENTS" CAGE_PORT="$PORT" \
     CAGE_MODEL="${CAGE_MODEL:-claude-haiku-4-5}" ADV_MODEL_RUN="${ADV_MODEL_RUN:-1}" "$GUEST_DIR/adv.sh" "$1" || rc=$?
   [[ $rc == 0 ]] || log "adv.sh $1 exited $rc"
+  sleep 1 # tether writes a CONNECT's line when the tunnel closes
   python3 "$HERE/advcheck.py" "$audit" "$from" "$1"
 }
 
