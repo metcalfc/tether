@@ -34,13 +34,23 @@
 #                      this run (advcheck.py); run `users` and `nono` first.
 #                      CASE: readme, pkg, root (root also starts the
 #                      control listener, as attack does)
-#   cage.sh down       stop and remove the sandbox, stop the gateway
+#   cage.sh replay-policy
+#                      write CAGE_OUT/tether-replay.json: the compiled
+#                      tether config plus a second sandbox (NAME2, port
+#                      CAGE_PORT+10, session cage2). Export CAGE_POLICY to it
+#                      before gw-up and up, so one gateway has both listeners
+#   cage.sh replay     milestone 7: boot NAME2, copy claude's caps out of the
+#                      first cage as root, replay them from NAME2 on its own
+#                      listener (expect 403), with controls on both channels,
+#                      then check the audit (advcheck.py replay); removes NAME2
+#   cage.sh down       stop and remove the sandbox(es), stop the gateway
 #   cage.sh status
 #
 # Environment: CAGE_NAME (tether-cage), CAGE_IMAGE (node:22-bookworm),
 # CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001),
 # CAGE_MODEL (claude-haiku-4-5, for works), CAGE_AGENTS ("claude codex"),
 # CAGE_NONO_DIR (~/.microsandbox/tether-guest/bin, mounted at /opt/nono).
+# CAGE_POLICY overrides the compiled tether config (replay-policy's file).
 # With CAGE_OUT (a `tether compile` output directory) the machine name, port,
 # agents, msb flags, tether policy and every grant come from there instead,
 # and CAGE_GW defaults to ./tether. CAGE_SOURCE is the policy `compile` reads
@@ -56,7 +66,7 @@ if [[ -n $OUT && -f $OUT/machine.env ]]; then
   # shellcheck source=/dev/null # written by tether compile
   . "$OUT/machine.env"
   CAGE_GW=${CAGE_GW:-$REPO/tether}
-  CAGE_POLICY=$OUT/tether.json
+  CAGE_POLICY=${CAGE_POLICY:-$OUT/tether.json}
 fi
 SESSION=${CAGE_SESSION:-cage}
 NAME=${CAGE_NAME:-tether-cage}
@@ -278,7 +288,105 @@ cmd_adv() {
   python3 "$HERE/advcheck.py" "$audit" "$from" "$1" "$POLICY"
 }
 
+NAME2=$NAME-2
+PORT2=$((PORT + 10))
+SESSION2=${SESSION}2
+
+cmd_replay_policy() {
+  need_out
+  python3 - "$OUT/tether.json" "$OUT/tether-replay.json" "$NAME2" "$PORT2" "$SESSION2" <<'PY'
+import json, sys
+src, dst, name, port, session = sys.argv[1:]
+cfg = json.load(open(src))
+cfg["_note"] += "; plus a second sandbox for the cap-replay case (cage.sh replay-policy)"
+cfg["sandboxes"][name] = {"listen": f"127.0.0.1:{port}", "advertise": f"http://host.microsandbox.internal:{port}",
+                          "sessions": [session]}
+json.dump(cfg, open(dst, "w"), indent=2)
+PY
+  log "wrote $OUT/tether-replay.json (sandboxes: $NAME on $PORT, $NAME2 on $PORT2); export CAGE_POLICY to it"
+}
+
+# The cap value from a cap file or env file: the first tth_ token in it, or
+# in a Basic header (the gitconfig format base64s it into http.extraHeader).
+cap_of() {
+  python3 -c 'import base64,re,sys
+t = sys.stdin.read()
+t += "".join(" " + base64.b64decode(b).decode(errors="replace") for b in re.findall(r"Basic ([A-Za-z0-9+/=]+)", t))
+m = re.search(r"tth_[A-Za-z0-9_-]+", t)
+print(m.group(0) if m else "")'
+}
+
+# Run a probe script in a sandbox as root, caps on stdin (never in argv or on
+# disk). The script reads AGENT_CAP, GIT_CAP and OWN_CAP, one per line.
+probe_in() { # probe_in SANDBOX PORT SCRIPT
+  limit 120 "$MSB" exec "$1" -- env GW="http://host.microsandbox.internal:$2" OTHER_GW="http://host.microsandbox.internal:$3" \
+    bash -c 'set -u; read -r AGENT_CAP; read -r GIT_CAP; read -r OWN_CAP; '"$4"
+}
+
+# The probes: a model route (free GET), a CONNECT and a git clone's first
+# request, each with claude's agent or git cap, plus OWN_CAP (this sandbox's
+# own session cap) as a control and the other sandbox's listener port.
+# shellcheck disable=SC2016 # expanded in the guest
+REPLAY_PROBES='
+code() { curl -s -o /dev/null -m 15 -w "%{http_code}" "$@" 2>/dev/null || true; }
+conn() { curl -s -o /dev/null -m 15 -w "%{http_connect}" "$@" 2>/dev/null || true; } # the proxy answer to CONNECT
+echo "models   $(code -H "x-api-key: $AGENT_CAP" -H "anthropic-version: 2023-06-01" "$GW/anthropic/v1/models")   claude agent cap, GET /anthropic/v1/models"
+echo "connect  $(conn -x "http://agent:$AGENT_CAP@${GW#http://}" https://pypi.org/simple/)   claude agent cap, CONNECT pypi.org"
+echo "git      $(code -u "x:$GIT_CAP" "$GW/github/metcalfc/tether-scratch/info/refs?service=git-upload-pack")   claude git cap, info/refs"
+echo "own      $(conn -x "http://agent:$OWN_CAP@${GW#http://}" https://pypi.org/simple/)   own session cap, CONNECT pypi.org (control)"
+echo "port     $(code "$OTHER_GW/")   the other sandbox listener, no cap"
+'
+
+cmd_replay() {
+  need_out
+  python3 -c 'import json,sys; sys.exit(sys.argv[2] not in json.load(open(sys.argv[1]))["sandboxes"])' "$POLICY" "$NAME2" ||
+    die "$POLICY has no sandbox $NAME2: cage.sh replay-policy, export CAGE_POLICY, then gw-up and up"
+  sandbox_exists || die "sandbox $NAME is not up"
+  local audit from caps own rc=0 args=() l t0 t1 state
+  state=$(state_dir)
+  audit="$state/audit.jsonl"
+  from=$(wc -l <"$audit" | tr -d ' ')
+  # The first cage's machine flags, renamed and re-pointed at the second listener.
+  while IFS= read -r l; do
+    case $l in
+      "$NAME") args+=("$NAME2") ;;
+      "allow@host:tcp:$PORT") args+=("allow@host:tcp:$PORT2") ;;
+      *) args+=("$l") ;;
+    esac
+  done <"$OUT/msb.args"
+  "$MSB" list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$NAME2" && die "sandbox $NAME2 exists; cage.sh down first"
+  log "booting the second sandbox: msb ${args[*]}"
+  t0=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+  limit 300 "$MSB" "${args[@]}" -q
+  limit 60 "$MSB" exec "$NAME2" -- true
+  t1=$(perl -MTime::HiRes=time -e 'printf "%.3f", time')
+  log "$NAME2 boot to first exec: $(perl -e 'printf "%.2f", $ARGV[1]-$ARGV[0]' "$t0" "$t1")s"
+  # Root in the first cage reads claude's caps (run 24: root reads every cap).
+  caps="$(limit 30 "$MSB" exec "$NAME" -- cat /run/tether/claude/agent | cap_of)
+$(limit 30 "$MSB" exec "$NAME" -- cat /run/tether/claude/git | cap_of)"
+  [[ $(printf '%s\n' "$caps" | grep -c '^tth_') == 2 ]] || die "could not read claude's agent and git caps from $NAME"
+  log "copied claude's agent and git caps out of $NAME (values not shown)"
+  own=$(cap_of <"$state/$SESSION2.env")
+  printf '\n== replayed from %s, on its own listener :%s ==\n' "$NAME2" "$PORT2"
+  printf '%s\n%s\n' "$caps" "$own" | probe_in "$NAME2" "$PORT2" "$PORT" "$REPLAY_PROBES" || rc=$?
+  own=$(cap_of <"$state/$SESSION.env")
+  printf '\n== control: the same caps in %s, on its listener :%s ==\n' "$NAME" "$PORT"
+  printf '%s\n%s\n' "$caps" "$own" | probe_in "$NAME" "$PORT" "$PORT2" "$REPLAY_PROBES" || rc=$?
+  caps='' own=''
+  limit 60 "$MSB" stop "$NAME2" >/dev/null 2>&1 || true
+  limit 60 "$MSB" rm "$NAME2" >/dev/null 2>&1 || true
+  log "sandbox $NAME2 removed"
+  [[ $rc == 0 ]] || log "a probe script exited $rc"
+  sleep 1 # tether writes a CONNECT's line when the tunnel closes
+  python3 "$HERE/advcheck.py" "$audit" "$from" replay "$POLICY"
+}
+
 cmd_down() {
+  if "$MSB" list 2>/dev/null | awk 'NR>1 {print $1}' | grep -qx "$NAME2"; then
+    limit 60 "$MSB" stop "$NAME2" >/dev/null 2>&1 || true
+    limit 60 "$MSB" rm "$NAME2" >/dev/null 2>&1 || true
+    log "sandbox $NAME2 removed"
+  fi
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
     limit 60 "$MSB" rm "$NAME" >/dev/null 2>&1 || true
@@ -293,8 +401,8 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  compile | gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | down | status) "cmd_${1//-/_}" ;;
+  compile | gw-up | gw-down | up | check | push | attack | works | users | caps | nono | proc | replay-policy | replay | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
   adv) shift; cmd_adv "$@" ;;
-  *) sed -n '2,48p' "$0"; exit 2 ;;
+  *) sed -n '2,57p' "$0"; exit 2 ;;
 esac

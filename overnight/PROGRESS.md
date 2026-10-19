@@ -6,20 +6,17 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 7 item 3 (root in the guest) is done (run 24). **Next: milestone 7,
-item 4: a cap replayed from a second sandbox gets a 403.** Plan: boot a second
-msb sandbox (another name, its own listener port, e.g. 18011, and a second
-`sandboxes` entry in the tether policy, so tether binds one listener per
-sandbox), copy claude's agent cap out of the first cage's `/run/tether/claude/agent`
-as root (cap value redacted in logs), and use it from the second sandbox
-against its own listener: model route (`GET /anthropic/v1/models`, free) and
-a CONNECT to pypi.org. Expect a 403 with a `cap:channel`-style rule and the
-audit line naming the second sandbox. Control: the same request from the
-first cage gets 200. Add `advcheck.py replay`. Check how `tether compile`
-emits sandboxes first (`overnight/run/compiled/tether.json` has only
-`tether-cage`), and whether the channel check is already unit-tested
-(item "Channel binding" in milestones 3-4). Then item 5 (four concurrent
-streams against the cap; record the overshoot, with and without reservations).
+Milestone 7 item 4 (cap replayed from a second sandbox) is done (run 25).
+**Next: milestone 7, item 5: four concurrent streams against the cap; record
+the overshoot, with and without reservations.** Plan: check what run 14
+already measured (spend log: "3 allowed + 4 refused at admission"). If it
+covers this, rerun it from the cage as claude: four parallel streaming
+`/anthropic/v1/messages` calls (haiku, short prompts) against a
+session cap set just above one call's reservation. Then measure the
+overshoot (spend minus cap) once with reservations on and once with them
+off (does tether have a switch? if not, add a policy knob plus a unit test).
+Keep the cap tiny (cents) so the test is cheap. Record both numbers here and
+in the milestone-8 RESULTS table. After that: milestone 8.
 
 The cage now boots from compiled output. `CAGE_OUT` sets the machine name,
 port, agents, msb flags, tether policy and every cap grant; without it,
@@ -34,6 +31,18 @@ spike/msb/cage.sh nono && spike/msb/cage.sh proc
 spike/msb/cage.sh exec 'npm install -g @anthropic-ai/claude-code'   # as guest root, ~12 s
 spike/msb/cage.sh adv readme     # ADV_MODEL_RUN=0 skips the Claude Code part
 # ... and always: spike/msb/cage.sh down
+```
+
+For the replay case (run 25), one gateway needs both listeners, so write the
+two-sandbox policy before `gw-up` and keep `CAGE_POLICY` exported for every
+later step:
+
+```sh
+spike/msb/cage.sh compile && spike/msb/cage.sh replay-policy
+export CAGE_POLICY=$CAGE_OUT/tether-replay.json
+spike/msb/cage.sh gw-up && spike/msb/cage.sh up && spike/msb/cage.sh users && spike/msb/cage.sh nono
+spike/msb/cage.sh replay        # boots tether-cage-2, probes, removes it
+spike/msb/cage.sh down
 ```
 
 Older cage env (runs 11-18, hand-written policy, before compile):
@@ -1038,7 +1047,7 @@ Run 21 (2026-10-19) notes:
 - [x] Injected README (paste site, push to another org)
 - [x] Malicious npm package fixture (postinstall)
 - [x] Root in the guest: kill nono, flush nftables, try DNS, raw IPs and host ports
-- [ ] Capability replayed from a second sandbox gets a 403
+- [x] Capability replayed from a second sandbox gets a 403
 - [ ] Four concurrent streams against the cap; record the overshoot
 
 Run 22 (2026-10-19) notes:
@@ -1182,6 +1191,47 @@ Run 24 (2026-10-19) notes:
   outside the compiled ceiling, and no model call was billed.
 - Tests: 91 OK (tether 77 + leash 14, no tether change). ruff, shellcheck
   and `/bin/bash -n` are clean. Logs: `overnight/run/run24-{boot,nono,adv}.log`.
+
+Run 25 (2026-10-19) notes:
+
+- New: `cage.sh replay-policy` writes `CAGE_OUT/tether-replay.json`: the
+  compiled tether config plus a second sandbox, `tether-cage-2`, listening on
+  `127.0.0.1:18011` with session `cage2`. With `CAGE_POLICY` exported to it,
+  one tether process serves both listeners. `cage.sh` now lets `CAGE_POLICY`
+  override the compiled config; before, `CAGE_OUT` always won. `cage.sh replay` boots
+  `tether-cage-2` from the same compiled msb flags, renamed and with the net
+  rule changed to `allow@host:tcp:18011`. It reads claude's agent cap and git
+  cap out of the first cage as root (`cat /run/tether/claude/{agent,git}`;
+  the git cap is decoded from the gitconfig's Basic header). The caps go to
+  the probe script on stdin, never in argv or on disk. The script runs the
+  same five probes in both sandboxes. Then it removes `tether-cage-2` and runs
+  `advcheck.py replay`. `cage.sh down` also removes `tether-cage-2` if a run
+  left it behind. Boot: `users` 0 failed, `nono` 0 failed, `tether-cage-2`
+  boot to first exec 0.29 s. No model calls (models GET is free).
+- **Results:**
+
+  | probe | from tether-cage-2 (:18011) | from tether-cage (:18001) |
+  | --- | --- | --- |
+  | claude agent cap, `GET /anthropic/v1/models` | **403** | 200 |
+  | claude agent cap, CONNECT pypi.org | **403** | 200 |
+  | claude git cap, scratch repo `info/refs` | **403** | 200 |
+  | the sandbox's own session cap, CONNECT pypi.org | 200 | 200 |
+  | the other sandbox's listener port, no cap | 000 | 000 |
+
+  The three refusals are audited on `tether-cage-2`, rule `cap:identify`,
+  with the reason `capability cap_... of session cage is bound to sandbox
+  tether-cage, used on tether-cage-2`. The reason gives the stolen cap's id,
+  not its value: no `tth_` appears in any audit line. A copied cap gets
+  nothing off its channel. The channel itself cannot be borrowed either,
+  because msb's per-sandbox port rule blocks each sandbox from the other's
+  listener (000 both ways).
+- **advcheck replay: 9/9 PASS.** The controls require a 200 (the models
+  control first returned an upstream 400, because my probe sent no
+  `anthropic-version`; fixed). The CONNECT probes read curl's
+  `%{http_connect}`, because `%{http_code}` is 000 when a proxy refuses a
+  CONNECT.
+- Tests: 91 OK (tether 77 + leash 14, no tether change). shellcheck,
+  `/bin/bash -n` and ruff are clean. Logs: `overnight/run/run25-{boot,replay}.log`.
 
 ## 8. Demo and write-up
 

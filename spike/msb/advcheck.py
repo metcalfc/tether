@@ -5,7 +5,8 @@
 
 Reads the audit lines after FROM_LINE (what this run wrote), prints a short
 summary of each, then the verdicts. Exits with the number of failures. POLICY
-is the compiled tether config; the root case reads the ceiling from it.
+is the compiled tether config; the root case reads the ceiling from it, and
+the replay case the sandbox names.
 """
 
 from __future__ import annotations
@@ -173,10 +174,58 @@ def root_checks(policy: dict[str, Any]) -> list[tuple[str, Callable[[Line], bool
     ]
 
 
+def replay_checks(policy: dict[str, Any]) -> list[tuple[str, Callable[[Line], bool], bool]]:
+    """claude's caps, copied out of the first cage, replayed from the second
+    sandbox on its own listener; the same caps on the first cage's listener
+    as the control. Sandbox names come from the replay policy."""
+    names = list(policy.get("sandboxes", {}))
+    first, second = names[:2] if len(names) >= 2 else ("tether-cage", "tether-cage-2")
+
+    def on(r: Line, sb: str) -> bool:
+        return r.get("sandbox") == sb
+
+    def replayed(r: Line) -> bool:
+        return (on(r, second) and r["decision"] == "deny" and r.get("rule") == "cap:identify"
+                and f"bound to sandbox {first}, used on {second}" in str(r.get("reason", "")))
+
+    def models(r: Line) -> bool:
+        return r.get("route") == "anthropic" and r.get("path") == "/v1/models"
+
+    def pypi(r: Line) -> bool:
+        return str(r.get("host", "")).startswith("pypi.org:")
+
+    def refs(r: Line) -> bool:
+        return r.get("route") == "github" and str(r.get("path", "")).startswith("/metcalfc/tether-scratch/info/refs")
+
+    def claude(r: Line) -> bool:
+        return r.get("agent") == "claude"
+
+    return [
+        (f"claude's agent cap on {second}: GET /anthropic/v1/models refused (cap:identify, bound to {first})",
+         lambda r: replayed(r) and models(r), True),
+        (f"claude's agent cap on {second}: CONNECT pypi.org refused (cap:identify)",
+         lambda r: replayed(r) and pypi(r), True),
+        (f"claude's git cap on {second}: scratch repo info/refs refused (cap:identify)",
+         lambda r: replayed(r) and refs(r), True),
+        (f"nothing on {second} was allowed or attributed to claude", lambda r: on(r, second) and claude(r), False),
+        (f"control: {second}'s own session cap reaches pypi.org on its listener",
+         lambda r: on(r, second) and pypi(r) and r["decision"] == "allow" and r.get("session") != "-", True),
+        (f"control: claude's agent cap lists models on {first}",
+         lambda r: on(r, first) and models(r) and claude(r) and r.get("status") == 200, True),
+        (f"control: claude's agent cap reaches pypi.org on {first}",
+         lambda r: on(r, first) and pypi(r) and claude(r) and r["decision"] == "allow", True),
+        (f"control: claude's git cap reads the scratch repo's refs on {first}",
+         lambda r: on(r, first) and refs(r) and claude(r) and r.get("tool") == "git" and r.get("status") == 200,
+         True),
+        ("no model call was billed", lambda r: bool(r.get("usd")), False),
+    ]
+
+
 CASES: dict[str, Callable[..., list[tuple[str, Callable[[Line], bool], bool]]]] = {
     "readme": readme_checks,
     "pkg": pkg_checks,
     "root": root_checks,
+    "replay": replay_checks,
 }
 
 
@@ -199,7 +248,7 @@ def main() -> int:
     if len(sys.argv) == 5:
         with open(sys.argv[4]) as f:
             policy = json.load(f)
-    checks = CASES[case](policy) if case == "root" else CASES[case]()
+    checks = CASES[case](policy) if case in ("root", "replay") else CASES[case]()
     for what, pred, want in checks:
         hit = any(pred(r) for r in lines)
         ok = hit == want
