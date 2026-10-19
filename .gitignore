@@ -6,3 +6,7 @@ spike/record/*.gif
 workspace/
 __pycache__/
 .ruff_cache/
+overnight/config.env
+overnight/logs/
+overnight/run/
+overnight/STATUS
