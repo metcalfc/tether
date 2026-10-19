@@ -6,19 +6,22 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 3: **capability registry** (`tether cap mint|revoke|list`,
-minted per boot). Today `Gateway.sessions` (cap -> session, from
-`state_dir/sessions.json`) plus `Policy.session_sandbox` (session ->
-sandbox) are the binding; `Gateway.identify(presented, sandbox)` is the
-single lookup that returns `(session, refusal)`. Replace both with a registry
-record per cap: `{cap_id, sandbox, session, agent, tool, human, routes,
-egress, spend sub-cap, expiry, revoked}`, persisted 0600 in state_dir, and
-re-read (or watched) by `serve` so `tether cap revoke` takes effect on the
-next request without a restart. Keep `identify` as the entry point (have it
-return the record). `tether init` / the `sessions` list can mint the
-default caps so leash-style policies keep working. Unit tests: mint, list,
-revoke takes effect on a running server, an expired cap is refused, a cap
-minted for sandbox A is refused on B.
+Milestone 3, item 4: **per-cap policy intersected with the ceiling.** Each
+registry record already carries `routes`, `egress` and `spend_usd` (None =
+whatever the ceiling allows); `tether cap mint --route R --egress H --spend
+USD` sets them and rejects unknown route names, but **nothing enforces them
+yet**. Enforce in the handler, after `identify`: a route not in
+`cap["routes"]` gets 403 (audit `rule`-style reason "route not granted to
+this cap"); a CONNECT host must match both the policy allowlist (ceiling)
+and `cap["egress"]` if set; `spend_usd` is a per-cap daily sub-cap (Ledger
+needs a second key, e.g. `cap:<cap_id>`, next to the session). Mint should
+refuse an egress pattern that is not inside the ceiling (subset check:
+every cap pattern must be matched by, or equal to, a ceiling pattern; treat
+a cap wildcard wider than the ceiling as an error). Unit tests: cap C with
+routes [anthropic] gets 403 on /github/; npm cap with egress
+[registry.npmjs.org] can't CONNECT to pypi.org even though the ceiling
+allows it; sub-cap refuses the next call while the session still has
+budget; mint with a wider egress than the ceiling fails.
 Boot the cage with the Landlock kernel when a VM is needed:
 `export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
 (rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
@@ -267,7 +270,7 @@ Run 6 (2026-10-18) notes:
 
 - [x] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
 - [x] Channel binding: one listener per sandbox
-- [ ] Capability registry: `tether cap mint|revoke|list`, minted per boot
+- [x] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [ ] Per-cap policy intersected with the ceiling
 - [ ] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
 - [ ] Streamed request bodies (large `git push`)
@@ -326,6 +329,53 @@ Run 8 (2026-10-18) notes:
   (that is milestone 7 item 4).
 - Note: the Bash tool's shell is zsh, which doesn't word-split `$var`; run
   ad-hoc loops under `/bin/bash -c`.
+- No model calls this run, no VM booted.
+
+Run 9 (2026-10-18) notes:
+
+- **Registry:** `state_dir/caps.json` (0600), `{"caps": {sha256(cap):
+  record}}`; record = `cap_id` (`cap_` + 12 hex), `sandbox`, `session`,
+  `agent`, `tool`, `human`, `routes`, `egress`, `spend_usd`, `minted`,
+  `expires`, `revoked` (epoch seconds or null). **Decision: keyed by hash**, so
+  the registry and `cap list --json` never hold a usable cap; the cap is
+  printed once by `mint` (or written with `--env PATH`) and lives only in env
+  files / the guest tmpfs. Writers take `flock(caps.lock)`, rewrite to a temp
+  file and `os.replace`; `serve` stats the file on each lookup (inode, mtime_ns,
+  size) and reloads on change. That is how revoke bites with no restart.
+- `sessions.json` is gone; there is **no migration** from it (only throwaway
+  tether state dirs existed). leash and `spike/msb/cage.sh` are unaffected
+  (cage.sh still runs `./leash`).
+- **CLI:** `tether cap mint --session S [--sandbox] [--agent] [--tool]
+  [--human] [--route R]... [--egress H]... [--spend USD] [--ttl 30m] [--env
+  PATH]`; `cap revoke [CAP_ID...] [--sandbox S] [--session S]` (exit 1 if
+  nothing live matched); `cap list [--all] [--json]`; `cap boot SANDBOX`
+  (revoke every cap of that sandbox, mint fresh default session caps, rewrite
+  `<session>.env`: the "minted per boot" step). `tether init` and `serve`
+  call `init_caps`: one default cap per session, idempotent (keeps a live cap
+  found in the env file; re-mints if it was revoked/expired). `serve` no
+  longer rewrites env files with existing caps (it can't: only hashes are
+  stored).
+- **identify** returns `(record, (audit_reason, guest_message))`. Revoked or
+  expired caps get **403** "capability is revoked/expired" (not 401/407: the
+  cap is real, a retry won't help); wrong sandbox 403 as before; a record
+  whose session is no longer in that sandbox's policy is refused too. Audit
+  lines now carry `cap_id`, `agent`, `tool`, `human` when set (item 9 adds the
+  rest); the stderr log shows `[sandbox/session/agent/tool]`.
+- **Tests:** shared `TwoSandboxes` fixture; `RegistryTest` (7): mint prints a
+  working cap, registry holds no cap and is 0600; list shows records never
+  caps; revoke via the CLI (its own Registry, as a separate process would) on
+  a running server, routes and CONNECT, no upstream call; revoke by sandbox;
+  expired cap refused (clock shifted); cap minted for A refused on B, mint
+  outside the sandbox or with an unknown route refused; init idempotent and
+  boot rotates one sandbox only. `make test`: **42 tests OK** (leash 14
+  unchanged, tether 28). ruff and shellcheck clean.
+- **Real run** (`overnight/run/cb/real.sh`, two listeners 18101/18102, CONNECT
+  to registry.npmjs.org, CLI in separate processes against a live `serve`):
+  own cap 200; on the other port refused; minted claude/npm cap (ttl 30m) 200;
+  after `cap revoke <id>` refused while the session cap still 200; after
+  `cap boot chad-dev` the old session cap is refused and the new one 200.
+  Audit e.g. `DENY [chad-dev/-] egress registry.npmjs.org:443 -- capability
+  cap_c07fe1b17409 of session chad-dev is revoked`.
 - No model calls this run, no VM booted.
 
 ## 5. Identity in the guest

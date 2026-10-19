@@ -6,15 +6,18 @@ python3 -m unittest discover -s tests -v
 from __future__ import annotations
 
 import base64
+import contextlib
 import http.client
 import http.server
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from typing import Any
@@ -141,7 +144,7 @@ class TetherTest(unittest.TestCase):
         self.srv = srvs["default"]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.port = self.srv.server_address[1]
-        self.caps = {name: cap for cap, name in self.gw.sessions.items()}
+        self.caps = tether.init_caps(self.policy, self.gw.caps)
 
     def tearDown(self) -> None:
         self.srv.shutdown()
@@ -296,7 +299,7 @@ class TetherTest(unittest.TestCase):
     # --- env
 
     def test_env_file_holds_no_credentials(self) -> None:
-        files = tether.write_env_files(self.policy, self.gw.sessions)
+        files = [self.policy.state_dir / f"{s}.env" for s in self.caps]
         text = "".join(f.read_text() for f in files)
         self.assertNotIn(REAL_KEY, text)
         self.assertNotIn(GH_TOKEN, text)
@@ -324,8 +327,8 @@ class TetherTest(unittest.TestCase):
         tether.cmd_report(self.policy, as_json=False)
 
 
-class ChannelBindingTest(unittest.TestCase):
-    """Two sandboxes, two listeners: a cap only works on its own sandbox's port."""
+class TwoSandboxes(unittest.TestCase):
+    """Fixture: two sandboxes, two listeners, one gateway."""
 
     def setUp(self) -> None:
         FakeUpstream.seen = []
@@ -352,7 +355,7 @@ class ChannelBindingTest(unittest.TestCase):
         for s in self.srvs.values():
             threading.Thread(target=s.serve_forever, daemon=True).start()
         self.ports = {n: s.server_address[1] for n, s in self.srvs.items()}
-        self.caps = {name: cap for cap, name in self.gw.sessions.items()}
+        self.caps = tether.init_caps(self.policy, self.gw.caps)
 
     def tearDown(self) -> None:
         for s in self.srvs.values():
@@ -383,6 +386,18 @@ class ChannelBindingTest(unittest.TestCase):
         f = self.policy.state_dir / "audit.jsonl"
         return [json.loads(x) for x in f.read_text().splitlines()]
 
+    def cli(self, *args: str) -> str:
+        """Run the tether CLI in-process, as a separate process would: its own
+        Registry, talking to the running server only through caps.json."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            tether.main(["-c", str(self.policy.path), *args])
+        return out.getvalue()
+
+
+class ChannelBindingTest(TwoSandboxes):
+    """A cap only works on its own sandbox's port."""
+
     def test_two_listeners_one_per_sandbox(self) -> None:
         self.assertEqual(set(self.srvs), {"chad-dev", "other"})
         self.assertNotEqual(self.ports["chad-dev"], self.ports["other"])
@@ -408,7 +423,7 @@ class ChannelBindingTest(unittest.TestCase):
         self.assertEqual((rec["decision"], rec["sandbox"]), ("deny", "other"))
 
     def test_env_advertises_each_sandbox_listener(self) -> None:
-        files = {f.stem: f.read_text() for f in tether.write_env_files(self.policy, self.gw.sessions)}
+        files = {s: (self.policy.state_dir / f"{s}.env").read_text() for s in self.caps}
         self.assertIn("ANTHROPIC_BASE_URL=http://host.microsandbox.internal:18001/anthropic", files["chad-dev"])
         # default advertise is the msb host alias on the sandbox's listen port
         self.assertIn(
@@ -424,6 +439,101 @@ class ChannelBindingTest(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             tether.Policy(p)
+
+
+class RegistryTest(TwoSandboxes):
+    """tether cap mint|revoke|list|boot, against a running gateway."""
+
+    def test_mint_prints_a_working_cap_once(self) -> None:
+        mint = ["cap", "mint", "--session", "o1", "--agent", "claude", "--tool", "git", "--human", "chad"]
+        cap = self.cli(*mint).strip()
+        self.assertTrue(cap.startswith("tth_"))
+        self.assertEqual(self.post("other", cap), 200)
+        rec = self.audit()[-1]
+        self.assertEqual((rec["session"], rec["agent"], rec["tool"], rec["human"]), ("o1", "claude", "git", "chad"))
+        self.assertTrue(rec["cap_id"].startswith("cap_"))
+        # the registry is keyed by hash: it never holds a usable cap
+        reg = (self.policy.state_dir / "caps.json").read_text()
+        self.assertNotIn(cap, reg)
+        self.assertNotIn(self.caps["o1"], reg)
+        self.assertEqual(oct((self.policy.state_dir / "caps.json").stat().st_mode & 0o777), "0o600")
+
+    def test_list_shows_records_never_caps(self) -> None:
+        cap = self.cli("cap", "mint", "--session", "o2", "--tool", "npm").strip()
+        listing = self.cli("cap", "list")
+        self.assertIn("npm", listing)
+        self.assertEqual(len(listing.splitlines()), 1 + 3 + 1)  # header, three session caps, the new one
+        rows = json.loads(self.cli("cap", "list", "--json"))
+        self.assertEqual({r["state"] for r in rows}, {"live"})
+        for c in [cap, *self.caps.values()]:
+            self.assertNotIn(c, listing + json.dumps(rows))
+
+    def test_revoke_takes_effect_on_a_running_server(self) -> None:
+        cap = self.caps["chad-dev"]
+        self.assertEqual(self.post("chad-dev", cap), 200)
+        self.assertIn(b"200", self.connect("chad-dev", cap))
+        cid = self.gw.caps.lookup(cap)["cap_id"]
+        self.cli("cap", "revoke", cid)
+        n = len(FakeUpstream.seen)
+        self.assertEqual(self.post("chad-dev", cap), 403)
+        self.assertIn(b"403", self.connect("chad-dev", cap))
+        self.assertEqual(len(FakeUpstream.seen), n)
+        self.assertIn(f"{cid} of session chad-dev is revoked", self.audit()[-1]["reason"])
+        # the other sandbox's caps are untouched
+        self.assertEqual(self.post("other", self.caps["o1"]), 200)
+        rows = json.loads(self.cli("cap", "list", "--all", "--json"))
+        self.assertEqual([r["state"] for r in rows if r["cap_id"] == cid], ["revoked"])
+        self.assertNotIn(cid, self.cli("cap", "list"))
+
+    def test_revoke_by_sandbox(self) -> None:
+        self.cli("cap", "revoke", "--sandbox", "other")
+        self.assertEqual(self.post("other", self.caps["o1"]), 403)
+        self.assertEqual(self.post("other", self.caps["o2"]), 403)
+        self.assertEqual(self.post("chad-dev", self.caps["chad-dev"]), 200)
+        with self.assertRaises(SystemExit):
+            self.cli("cap", "revoke", "--sandbox", "other")  # nothing live is left to revoke
+
+    def test_expired_cap_is_refused(self) -> None:
+        cap, rec = self.gw.caps.mint("other", "o1", ttl_secs=60)
+        self.assertEqual(self.post("other", cap), 200)
+        real = time.time
+        try:
+            tether.time.time = lambda: real() + 61
+            self.assertEqual(self.post("other", cap), 403)
+        finally:
+            tether.time.time = real
+        self.assertIn("is expired", self.audit()[-1]["reason"])
+        self.assertEqual(tether.parse_ttl("8h"), 8 * 3600)
+        with self.assertRaises(ValueError):
+            tether.parse_ttl("8")
+
+    def test_cap_minted_for_a_is_refused_on_b(self) -> None:
+        cap = self.cli("cap", "mint", "--session", "chad-dev", "--tool", "git").strip()
+        self.assertEqual(self.post("chad-dev", cap), 200)
+        self.assertEqual(self.post("other", cap), 403)
+        self.assertIn(b"403", self.connect("other", cap))
+        self.assertIn("bound to sandbox chad-dev, used on other", self.audit()[-1]["reason"])
+        # and a cap can't be minted for a session outside its sandbox
+        with self.assertRaises(SystemExit):
+            self.cli("cap", "mint", "--session", "o1", "--sandbox", "chad-dev")
+        with self.assertRaises(SystemExit):
+            self.cli("cap", "mint", "--session", "o1", "--route", "github")
+
+    def test_init_is_idempotent_and_boot_rotates(self) -> None:
+        env = self.policy.state_dir / "o1.env"
+        before = env.read_text()
+        self.assertEqual(tether.init_caps(self.policy, self.gw.caps), {})
+        self.assertEqual(env.read_text(), before)
+        self.cli("cap", "boot", "other")
+        self.assertNotEqual(env.read_text(), before)
+        fresh = tether.env_file_cap(env)
+        self.assertEqual(self.post("other", self.caps["o1"]), 403, "the last boot's cap is dead")
+        self.assertEqual(self.post("other", fresh), 200)
+        self.assertEqual(self.post("chad-dev", self.caps["chad-dev"]), 200, "boot touches one sandbox only")
+        # an env file whose cap was revoked is re-minted by init
+        self.cli("cap", "revoke", "--session", "o1")
+        self.assertIn("o1", tether.init_caps(self.policy, self.gw.caps))
+        self.assertEqual(self.post("other", tether.env_file_cap(env)), 200)
 
 
 if __name__ == "__main__":

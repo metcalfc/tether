@@ -24,7 +24,8 @@ cannot reach into, does four things:
 
 Stdlib only. Python 3.10+.
 
-    tether init   -c policy.json   mint session capabilities, write run/tether/<session>.env
+    tether init   -c policy.json   mint a cap per session, write run/tether/<session>.env
+    tether cap    -c policy.json   mint|revoke|list|boot capabilities (live, no restart)
     tether serve  -c policy.json   run the gateway
     tether report -c policy.json   spend and denials per session, from the audit log
 """
@@ -33,8 +34,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import datetime as dt
+import fcntl
 import fnmatch
+import hashlib
 import http.client
 import http.server
 import json
@@ -50,6 +54,7 @@ import threading
 import time
 import urllib.parse
 from collections import Counter, defaultdict
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -206,26 +211,126 @@ class Policy:
         self.prices: dict[str, list[float]] = cfg.get("prices_per_mtok", {"default": [5, 25]})
 
 
-# ------------------------------------------------------------ sessions & env
+# ------------------------------------------------------- capability registry
+
+CAP_PREFIX = "tth_"
 
 
-def load_sessions(policy: Policy) -> dict[str, str]:
-    """capability -> session name. Minted once, kept in state_dir/sessions.json
-    (0600). Delete that file to rotate every capability."""
-    policy.state_dir.mkdir(parents=True, exist_ok=True)
-    f = policy.state_dir / "sessions.json"
-    by_name: dict[str, str] = {}
-    if f.exists():
-        by_name = json.loads(f.read_text())
-    changed = False
-    for name in policy.session_names:
-        if name not in by_name:
-            by_name[name] = "tth_" + secrets.token_urlsafe(24)
-            changed = True
-    if changed or not f.exists():
-        f.write_text(json.dumps(by_name, indent=2))
-        f.chmod(0o600)
-    return {cap: name for name, cap in by_name.items() if name in policy.session_names}
+def cap_hash(cap: str) -> str:
+    return hashlib.sha256(cap.encode()).hexdigest()
+
+
+def cap_state(rec: dict[str, Any], now: float | None = None) -> str:
+    if rec.get("revoked"):
+        return "revoked"
+    exp = rec.get("expires")
+    if exp is not None and (now if now is not None else time.time()) >= exp:
+        return "expired"
+    return "live"
+
+
+def parse_ttl(s: str) -> float:
+    """90s, 30m, 8h, 2d -> seconds."""
+    units = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+    if not s or s[-1] not in units:
+        raise ValueError(f"bad ttl {s!r}: use e.g. 90s, 30m, 8h, 2d")
+    return float(s[:-1]) * units[s[-1]]
+
+
+class Registry:
+    """Every capability tether has minted: which sandbox it is bound to, who
+    holds it (session / agent / tool / human) and what it may do. Kept in
+    state_dir/caps.json (0600), keyed by the cap's sha256, so the file never
+    holds a usable cap. The CLI writes it; `serve` re-reads it whenever it
+    changes, so `tether cap revoke` bites on the next request."""
+
+    def __init__(self, state_dir: Path) -> None:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        self.path = state_dir / "caps.json"
+        self.lockfile = state_dir / "caps.lock"
+        self.lock = threading.Lock()
+        self.sig: tuple[int, int, int] | None = None
+        self.by_hash: dict[str, dict[str, Any]] = {}
+
+    def _sig(self) -> tuple[int, int, int] | None:
+        try:
+            st = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return st.st_ino, st.st_mtime_ns, st.st_size
+
+    def _load(self) -> None:
+        # Writers replace the file, so a new inode means new contents: one
+        # stat per request is the whole cost of live revocation.
+        sig = self._sig()
+        if sig != self.sig:
+            self.by_hash = json.loads(self.path.read_text()).get("caps", {}) if sig else {}
+            self.sig = sig
+
+    def lookup(self, cap: str) -> dict[str, Any] | None:
+        with self.lock:
+            self._load()
+            return self.by_hash.get(cap_hash(cap))
+
+    def records(self) -> list[dict[str, Any]]:
+        with self.lock:
+            self._load()
+            return sorted(self.by_hash.values(), key=lambda r: r["minted"])
+
+    @contextlib.contextmanager
+    def _edit(self) -> Iterator[dict[str, dict[str, Any]]]:
+        with self.lockfile.open("a") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            caps = json.loads(self.path.read_text()).get("caps", {}) if self.path.exists() else {}
+            yield caps
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"caps": caps}, indent=2))
+            tmp.chmod(0o600)
+            os.replace(tmp, self.path)
+
+    def mint(
+        self,
+        sandbox: str,
+        session: str,
+        agent: str | None = None,
+        tool: str | None = None,
+        human: str | None = None,
+        routes: list[str] | None = None,
+        egress: list[str] | None = None,
+        spend_usd: float | None = None,
+        ttl_secs: float | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """A new cap and its record. The cap itself is returned once and
+        stored nowhere but where the caller puts it."""
+        cap = CAP_PREFIX + secrets.token_urlsafe(24)
+        now = time.time()
+        rec: dict[str, Any] = {
+            "cap_id": "cap_" + secrets.token_hex(6),
+            "sandbox": sandbox,
+            "session": session,
+            "agent": agent,
+            "tool": tool,
+            "human": human,
+            # None means "whatever the ceiling allows"; narrowing is per-cap policy.
+            "routes": routes,
+            "egress": egress,
+            "spend_usd": spend_usd,
+            "minted": now,
+            "expires": now + ttl_secs if ttl_secs else None,
+            "revoked": None,
+        }
+        with self._edit() as caps:
+            caps[cap_hash(cap)] = rec
+        return cap, rec
+
+    def revoke(self, match: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+        out = []
+        with self._edit() as caps:
+            for rec in caps.values():
+                if cap_state(rec) != "revoked" and match(rec):
+                    rec["revoked"] = time.time()
+                    out.append(rec)
+        return out
 
 
 def env_for(policy: Policy, cap: str, advertise: str | None = None) -> dict[str, str]:
@@ -265,16 +370,51 @@ def env_for(policy: Policy, cap: str, advertise: str | None = None) -> dict[str,
     return env
 
 
-def write_env_files(policy: Policy, sessions: dict[str, str]) -> list[Path]:
-    out = []
-    for cap, name in sessions.items():
-        p = policy.state_dir / f"{name}.env"
-        sb = policy.sandboxes[policy.session_sandbox[name]]
-        lines = [f"{k}={v}" for k, v in env_for(policy, cap, sb.advertise).items()]
-        body = "\n".join(lines)
-        p.write_text(f"# tether session {name} (sandbox {sb.name}) -- capabilities only, no credentials\n{body}\n")
-        p.chmod(0o600)
-        out.append(p)
+def write_env_file(policy: Policy, path: Path, cap: str, rec: dict[str, Any]) -> Path:
+    sb = policy.sandboxes[rec["sandbox"]]
+    who = "/".join(x for x in (rec["session"], rec.get("agent"), rec.get("tool")) if x)
+    lines = [f"{k}={v}" for k, v in env_for(policy, cap, sb.advertise).items()]
+    body = "\n".join(lines)
+    head = f"# tether {rec['cap_id']} for {who} (sandbox {sb.name}) -- capabilities only, no credentials"
+    path.write_text(f"{head}\n{body}\n")
+    path.chmod(0o600)
+    return path
+
+
+def env_file_cap(path: Path) -> str:
+    if path.exists():
+        for line in path.read_text().splitlines():
+            if line.startswith("TETHER_CAPABILITY="):
+                return line.partition("=")[2]
+    return ""
+
+
+def init_caps(
+    policy: Policy, reg: Registry, sandboxes: list[str] | None = None, rotate: bool = False
+) -> dict[str, str]:
+    """One default cap per session (no agent, no tool), delivered as
+    state_dir/<session>.env -- leash's shape. Idempotent: a session whose env
+    file still holds a live cap keeps it. With `rotate` (a new boot), every
+    cap of those sandboxes is revoked first and fresh ones are minted.
+    Returns session -> cap for the caps minted now."""
+    names = sandboxes or list(policy.sandboxes)
+    if rotate:
+        reg.revoke(lambda r: r["sandbox"] in names)
+    out: dict[str, str] = {}
+    for sb in names:
+        for session in policy.sandboxes[sb].sessions:
+            f = policy.state_dir / f"{session}.env"
+            rec = reg.lookup(env_file_cap(f) or "-")
+            if rec and cap_state(rec) == "live" and (rec["sandbox"], rec["session"]) == (sb, session):
+                continue
+
+            def stale(r: dict[str, Any], s: str = session) -> bool:
+                return r["session"] == s and not r.get("agent") and not r.get("tool")
+
+            reg.revoke(stale)
+            cap, rec = reg.mint(sb, session)
+            write_env_file(policy, f, cap, rec)
+            out[session] = cap
     return out
 
 
@@ -328,7 +468,8 @@ class Audit:
         what = rec.get("host") or f"{rec.get('method')} /{rec.get('route')}{rec.get('path', '')}"
         extra = f" ${rec['usd']:.4f}" if rec.get("usd") else ""
         why = f" -- {rec['reason']}" if rec.get("reason") else ""
-        who = f"{rec.get('sandbox', '-')}/{rec.get('session', '-')}"
+        ident = [rec.get("sandbox", "-"), rec.get("session", "-")] + [rec[k] for k in ("agent", "tool") if rec.get(k)]
+        who = "/".join(ident)
         log(f"{flag} [{who}] {rec.get('kind')} {what}{extra}{why}")
 
 
@@ -446,26 +587,39 @@ def pump(a: socket.socket, b: socket.socket) -> tuple[int, int]:
     return sent[a], sent[b]
 
 
+# (reason for the audit log, message for the guest)
+Refusal = tuple[str, str]
+
+
 class Gateway:
     def __init__(self, policy: Policy) -> None:
         self.p = policy
-        self.sessions = load_sessions(policy)
+        self.caps = Registry(policy.state_dir)
         self.ledger = Ledger(policy.state_dir / "spend.json")
         self.audit = Audit(policy.state_dir / "audit.jsonl")
         self.cred_hosts = {r.host: name for name, r in policy.routes.items()}
 
-    def identify(self, presented: list[str], sandbox: str) -> tuple[str | None, str | None]:
-        """(session, refusal) for the caps presented on `sandbox`'s listener.
-        A cap that is real but bound to another sandbox is a replay: it is
-        refused outright, not treated as missing. The one place that knows
-        which sandbox a cap belongs to."""
+    def identify(self, presented: list[str], sandbox: str) -> tuple[dict[str, Any] | None, Refusal | None]:
+        """(cap record, refusal) for the caps presented on `sandbox`'s listener.
+        A cap that is real but revoked, expired or bound to another sandbox is
+        refused outright, not treated as missing. The one place that decides
+        whether a cap may be used here."""
+        now = time.time()
         for cand in presented:
-            for cap, name in self.sessions.items():
-                if cand and secrets.compare_digest(cand.encode(), cap.encode()):
-                    bound = self.p.session_sandbox.get(name)
-                    if bound != sandbox:
-                        return None, f"capability of session {name} is bound to sandbox {bound}, used on {sandbox}"
-                    return name, None
+            rec = self.caps.lookup(cand) if cand else None
+            if rec is None:
+                continue
+            cid, sess = rec["cap_id"], rec["session"]
+            state = cap_state(rec, now)
+            if state != "live":
+                return None, (f"capability {cid} of session {sess} is {state}", f"capability is {state}")
+            if rec["sandbox"] != sandbox:
+                why = f"capability {cid} of session {sess} is bound to sandbox {rec['sandbox']}, used on {sandbox}"
+                return None, (why, "capability is not valid on this sandbox's channel")
+            if self.p.session_sandbox.get(sess) != sandbox:
+                why = f"capability {cid}: session {sess} is no longer in sandbox {sandbox}'s policy"
+                return None, (why, "capability is not valid on this sandbox's channel")
+            return rec, None
         return None, None
 
     def egress_ok(self, host: str, port: int) -> tuple[bool, str]:
@@ -506,6 +660,13 @@ def presented_tokens(headers: dict[str, str]) -> list[str]:
     return out
 
 
+def who(cap: dict[str, Any] | None) -> dict[str, Any]:
+    """The identity fields an audit line carries for a cap (or its absence)."""
+    if cap is None:
+        return {"session": "-"}
+    return {k: cap.get(k) for k in ("session", "agent", "tool", "human", "cap_id")}
+
+
 def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -532,8 +693,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
 
         # ---- egress: CONNECT host:port, allowlisted, audited
         def do_CONNECT(self) -> None:
-            found, refusal = gw.identify(presented_tokens(self._hdrs()), sandbox)
-            session = found or "-"
+            cap, refusal = gw.identify(presented_tokens(self._hdrs()), sandbox)
             host, _, port_s = self.path.rpartition(":")
             host = host.strip("[]").lower()
             try:
@@ -541,30 +701,20 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             except ValueError:
                 self._error(400, "invalid_request_error", "bad CONNECT target")
                 return
+            rec: dict[str, Any] = {"kind": "egress", "sandbox": sandbox, **who(cap), "host": f"{host}:{port}"}
             if refusal:
-                gw.audit.write(
-                    kind="egress", decision="deny", sandbox=sandbox, session="-", host=f"{host}:{port}", reason=refusal
-                )
-                self._error(403, "permission_error", "capability is not valid on this sandbox's channel")
+                gw.audit.write(decision="deny", reason=refusal[0], **rec)
+                self._error(403, "permission_error", refusal[1])
                 return
             ok, why = gw.egress_ok(host, port)
             if not ok:
-                gw.audit.write(
-                    kind="egress", decision="deny", sandbox=sandbox, session=session, host=f"{host}:{port}", reason=why
-                )
+                gw.audit.write(decision="deny", reason=why, **rec)
                 self._error(403, "permission_error", f"{host}:{port} refused: {why}")
                 return
             # Egress costs a capability like everything else: otherwise any
             # process on the box gets out, and nothing says who it was.
-            if session == "-":
-                gw.audit.write(
-                    kind="egress",
-                    decision="deny",
-                    sandbox=sandbox,
-                    session=session,
-                    host=f"{host}:{port}",
-                    reason="bad or missing session capability",
-                )
+            if cap is None:
+                gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
                 self._error(
                     407,
                     "authentication_error",
@@ -575,15 +725,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             try:
                 up = socket.create_connection((host, port), timeout=10)
             except OSError as e:
-                gw.audit.write(
-                    kind="egress",
-                    decision="allow",
-                    sandbox=sandbox,
-                    session=session,
-                    host=f"{host}:{port}",
-                    status=502,
-                    reason=f"connect failed: {e}",
-                )
+                gw.audit.write(decision="allow", status=502, reason=f"connect failed: {e}", **rec)
                 self._error(502, "api_error", f"could not reach {host}:{port}")
                 return
             self.send_response(200, "Connection Established")
@@ -595,29 +737,21 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
             finally:
                 up.close()
             self.close_connection = True
-            gw.audit.write(
-                kind="egress",
-                decision="allow",
-                sandbox=sandbox,
-                session=session,
-                host=f"{host}:{port}",
-                bytes_up=up_bytes,
-                bytes_down=down_bytes,
-                ms=int((time.monotonic() - t0) * 1000),
-            )
+            ms = int((time.monotonic() - t0) * 1000)
+            gw.audit.write(decision="allow", bytes_up=up_bytes, bytes_down=down_bytes, ms=ms, **rec)
 
         # ---- credentialed routes: /<route>/<path>
         def _proxy(self) -> None:
             t0 = time.monotonic()
             hdrs = self._hdrs()
-            session, refusal = gw.identify(presented_tokens(hdrs), sandbox)
+            cap, refusal = gw.identify(presented_tokens(hdrs), sandbox)
             if self.path.startswith(("http://", "https://")):
                 host = urllib.parse.urlsplit(self.path).hostname
                 gw.audit.write(
                     kind="egress",
                     decision="deny",
                     sandbox=sandbox,
-                    session=session or "-",
+                    **who(cap),
                     host=f"{host}:80",
                     reason="plain-http forwarding is not offered",
                 )
@@ -638,7 +772,7 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 "method": self.command,
                 "path": rest,
                 "sandbox": sandbox,
-                "session": session or "-",
+                **who(cap),
             }
             if route is None:
                 gw.audit.write(decision="deny", reason="no such route", **rec)
@@ -649,14 +783,15 @@ def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestH
                 self._error(403, "permission_error", f"{rest} is not allowed on /{name}/")
                 return
             if refusal:
-                gw.audit.write(decision="deny", reason=refusal, **rec)
-                self._error(403, "permission_error", "capability is not valid on this sandbox's channel")
+                gw.audit.write(decision="deny", reason=refusal[0], **rec)
+                self._error(403, "permission_error", refusal[1])
                 return
-            if session is None:
+            if cap is None:
                 gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
                 extra = {"WWW-Authenticate": 'Basic realm="tether"'} if route.inject.startswith("basic:") else None
                 self._error(401, "authentication_error", "bad or missing session capability", extra)
                 return
+            session = cap["session"]
             if route.meter:
                 blocked = gw.cap_check(session)
                 if blocked:
@@ -788,16 +923,86 @@ def build_servers(policy: Policy) -> tuple[dict[str, Server], Gateway]:
 
 
 def cmd_init(policy: Policy) -> None:
-    sessions = load_sessions(policy)
-    for p in write_env_files(policy, sessions):
-        log(f"wrote {p}")
+    reg = Registry(policy.state_dir)
+    minted = init_caps(policy, reg)
+    for session in policy.session_names:
+        state = "minted" if session in minted else "kept"
+        log(f"{state} {policy.state_dir / (session + '.env')}")
     for name in policy.disabled_routes:
         log(f"route /{name}/ disabled: its credential did not resolve")
 
 
+def fmt_ts(t: float | None) -> str:
+    return dt.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds") if t else "-"
+
+
+def cmd_cap(policy: Policy, args: argparse.Namespace) -> None:
+    reg = Registry(policy.state_dir)
+    if args.cap_cmd == "mint":
+        sandbox = args.sandbox or policy.session_sandbox.get(args.session)
+        if sandbox not in policy.sandboxes:
+            raise SystemExit(f"tether: no sandbox {sandbox!r} (session {args.session!r} is in none)")
+        if args.session not in policy.sandboxes[sandbox].sessions:
+            raise SystemExit(f"tether: session {args.session!r} is not in sandbox {sandbox!r}")
+        unknown = [r for r in args.route or [] if r not in policy.routes]
+        if unknown:
+            raise SystemExit(f"tether: no such route(s): {', '.join(unknown)}")
+        cap, rec = reg.mint(
+            sandbox,
+            args.session,
+            agent=args.agent,
+            tool=args.tool,
+            human=args.human,
+            routes=args.route,
+            egress=[h.lower() for h in args.egress] if args.egress else None,
+            spend_usd=args.spend,
+            ttl_secs=parse_ttl(args.ttl) if args.ttl else None,
+        )
+        if args.env:
+            write_env_file(policy, args.env, cap, rec)
+            log(f"minted {rec['cap_id']} for sandbox {sandbox}, wrote {args.env}")
+        else:
+            log(f"minted {rec['cap_id']} for sandbox {sandbox}")
+            print(cap)
+    elif args.cap_cmd == "revoke":
+        if not (args.cap_id or args.sandbox or args.session):
+            raise SystemExit("tether: name cap ids, --sandbox or --session")
+        ids = set(args.cap_id)
+
+        def match(r: dict[str, Any]) -> bool:
+            return (
+                (not ids or r["cap_id"] in ids)
+                and (not args.sandbox or r["sandbox"] == args.sandbox)
+                and (not args.session or r["session"] == args.session)
+            )
+
+        gone = reg.revoke(match)
+        for r in gone:
+            log(f"revoked {r['cap_id']} ({r['sandbox']}/{r['session']})")
+        if not gone:
+            raise SystemExit("tether: no live capability matched")
+    elif args.cap_cmd == "boot":
+        if args.sandbox not in policy.sandboxes:
+            raise SystemExit(f"tether: no sandbox {args.sandbox!r}")
+        for session in init_caps(policy, reg, [args.sandbox], rotate=True):
+            log(f"minted {policy.state_dir / (session + '.env')}")
+    else:
+        now = time.time()
+        rows = [r for r in reg.records() if args.all or cap_state(r, now) == "live"]
+        if args.json:
+            print(json.dumps([{**r, "state": cap_state(r, now)} for r in rows], indent=2))
+            return
+        print(f"{'CAP':<16} {'STATE':<8} {'SANDBOX':<12} {'SESSION':<12} {'AGENT':<10} {'TOOL':<8} EXPIRES")
+        for r in rows:
+            print(
+                f"{r['cap_id']:<16} {cap_state(r, now):<8} {r['sandbox']:<12} {r['session']:<12} "
+                f"{r.get('agent') or '-':<10} {r.get('tool') or '-':<8} {fmt_ts(r.get('expires'))}"
+            )
+
+
 def cmd_serve(policy: Policy) -> None:
+    init_caps(policy, Registry(policy.state_dir))
     srvs, gw = build_servers(policy)
-    write_env_files(policy, gw.sessions)
     for name, sb in policy.sandboxes.items():
         sessions = ", ".join(sb.sessions)
         log(f"sandbox {name}: listening on {sb.listen}, advertised as {sb.advertise}, sessions {sessions}")
@@ -867,16 +1072,40 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="tether", description=__doc__.split("\n\n")[0])
     ap.add_argument("-c", "--config", default="policy.json", type=Path)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("init", help="mint session capabilities and write run/tether/<session>.env")
+    sub.add_parser("init", help="mint a default cap per session and write run/tether/<session>.env")
     sub.add_parser("serve", help="run the gateway")
     rp = sub.add_parser("report", help="spend and denials per session")
     rp.add_argument("--json", action="store_true")
+    cp = sub.add_parser("cap", help="mint, revoke and list capabilities")
+    csub = cp.add_subparsers(dest="cap_cmd", required=True)
+    m = csub.add_parser("mint", help="mint a cap; prints it (or writes --env) once")
+    m.add_argument("--session", required=True)
+    m.add_argument("--sandbox", help="default: the session's sandbox")
+    m.add_argument("--agent")
+    m.add_argument("--tool")
+    m.add_argument("--human")
+    m.add_argument("--route", action="append", help="limit to this route (repeatable)")
+    m.add_argument("--egress", action="append", help="limit to this host pattern (repeatable)")
+    m.add_argument("--spend", type=float, help="spend sub-cap, USD per day")
+    m.add_argument("--ttl", help="lifetime, e.g. 90s, 30m, 8h, 2d")
+    m.add_argument("--env", type=Path, help="write an env file (0600) instead of printing the cap")
+    r = csub.add_parser("revoke", help="revoke caps; takes effect on the next request")
+    r.add_argument("cap_id", nargs="*")
+    r.add_argument("--sandbox")
+    r.add_argument("--session")
+    b = csub.add_parser("boot", help="new boot: revoke every cap of a sandbox, mint fresh session caps")
+    b.add_argument("sandbox")
+    ls = csub.add_parser("list", help="caps and their state (never the caps themselves)")
+    ls.add_argument("--all", action="store_true", help="include revoked and expired")
+    ls.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
     policy = Policy(args.config)
     if args.cmd == "init":
         cmd_init(policy)
     elif args.cmd == "serve":
         cmd_serve(policy)
+    elif args.cmd == "cap":
+        cmd_cap(policy, args)
     else:
         cmd_report(policy, args.json)
 
