@@ -6,19 +6,23 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 1, third item: Claude Code end to end in the guest through leash,
-on the cheap model. Boot with `./spike/msb/cage.sh gw-up && ./spike/msb/cage.sh up`,
-then install Claude Code through the CONNECT allowlist (registry.npmjs.org is
-already allowed): `./spike/msb/cage.sh exec 'npm install -g @anthropic-ai/claude-code'`.
-Then run `./spike/msb/cage.sh exec 'ANTHROPIC_MODEL=claude-haiku-4-5 claude -p "Reply with exactly: TETHER_OK"'`,
-or `cage.sh works`, whose last step does the same (add
-`ANTHROPIC_MODEL=claude-haiku-4-5` to that call, or export it in `cmd_works`).
-Things to watch: does Claude Code need to reach anything else, such as
-statsig, sentry or `api.anthropic.com/api/hello`? `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
-is already set in cage.env. Look at `overnight/run/cage-gw.log` and the
-audit in `overnight/run/leash-msb/audit.jsonl` for refused requests. Record
-the spend from `./leash -c spike/msb/policy.json report` (or whatever today's
-leash calls it) in the Spend log. Finish with `./spike/msb/cage.sh down`.
+Milestone 1, fourth item: measure boot to agent-ready, and time to first byte
+through leash versus direct. Plan:
+- Boot to agent-ready: `cage.sh gw-up`, then time from `msb create` until
+  `claude --version` answers in the guest. Claude Code isn't in the image, so
+  either time it with the npm install (about 16 s through the proxy) and also
+  without it, or build a pre-baked image. Report both numbers honestly.
+- TTFB: a tiny stdlib Python client on the **host** that sends the same small,
+  streaming `/v1/messages` request (claude-haiku-4-5, max_tokens 16) N=20
+  times. Direct to api.anthropic.com with the key read in that process from
+  the keychain (never printed or logged), and through leash at
+  `http://127.0.0.1:18001/anthropic` with the cage capability from
+  `overnight/run/leash-msb/caps.json` (or cage.env). Record p50/p95 TTFB for
+  each, plus CONNECT setup time (e.g. `curl -w %{time_appconnect}` via the
+  proxy to registry.npmjs.org versus direct). Optionally repeat the
+  through-leash run from inside the guest to include msb's netstack hop.
+  Keep it cheap: about 40 haiku calls in total is well under $0.05.
+Then tear down with `cage.sh down`.
 
 ## 0. Setup
 
@@ -63,7 +67,7 @@ Run 1 (2026-10-18) notes:
 
 - [x] An msb sandbox with `--net-default deny --net-rule "allow@host:tcp:P"`, with today's leash on the host
 - [x] Port `spike/guest/attack.sh` and `works.sh` to the msb guest; every BLOCK line holds
-- [ ] Claude Code end to end in the guest through leash (cheap model)
+- [x] Claude Code end to end in the guest through leash (cheap model)
 - [ ] Measure boot to agent-ready, and time to first byte through leash versus direct
 
 Run 2 (2026-10-18) notes:
@@ -142,6 +146,23 @@ Run 3 (2026-10-18) notes:
     item).
 - No model calls this run.
 
+Run 4 (2026-10-18) notes:
+
+- `npm install -g @anthropic-ai/claude-code` in the guest, through the CONNECT
+  allowlist: **16 s**, installs **Claude Code 2.1.303**. It needed nothing but
+  registry.npmjs.org; no other host was refused during the install.
+- `ANTHROPIC_MODEL=claude-haiku-4-5 claude -p "Reply with exactly: TETHER_OK"`
+  in the guest prints `TETHER_OK`. The audit shows **exactly one request**:
+  `POST /anthropic/v1/messages`, 200, 1.8 s, 114 KB up (system prompt and
+  tools), model `claude-haiku-4-5-20251001`, 29,672 cache-write tokens,
+  $0.0375. With `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, Claude Code made
+  no calls to statsig, sentry, `/api/hello` or anything else. Plain
+  forwarding works and no rewriting was needed, so that gate doesn't trigger.
+- `cage.sh works` now exports `ANTHROPIC_MODEL=${CAGE_MODEL:-claude-haiku-4-5}`.
+  The full works suite passes in the cage, Claude step included (second call
+  $0.0032, cache read).
+- Spend this run: 2 model calls, $0.0407 (leash report, session `cage`).
+
 ## 2. Kernel (design day 2, gate)
 
 - [ ] Build libkrunfw with `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and landlock in `CONFIG_LSM`; load with `MSB_LIBKRUNFW_PATH`
@@ -193,5 +214,6 @@ Run 3 (2026-10-18) notes:
 
 | Run | Model calls | USD (from tether report) |
 | --- | --- | --- |
+| 4 | 2 (haiku, via leash) | $0.0407 |
 
 ## Decisions and corrections

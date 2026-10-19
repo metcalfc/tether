@@ -21,7 +21,8 @@
 #   cage.sh status
 #
 # Environment: CAGE_NAME (tether-cage), CAGE_IMAGE (node:22-bookworm),
-# CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001).
+# CAGE_GW (./leash), CAGE_POLICY (spike/msb/policy.json), CAGE_PORT (18001),
+# CAGE_MODEL (claude-haiku-4-5, for works).
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -155,7 +156,11 @@ cmd_attack() {
   return "$rc"
 }
 
-cmd_works() { limit 600 "$MSB" exec "$NAME" --no-stdin -- bash -lc "set -a; . $GUEST_ENV; set +a; $GUEST_DIR/works.sh"; }
+# Functional runs use the cheap model; CAGE_MODEL overrides it.
+cmd_works() {
+  limit 600 "$MSB" exec "$NAME" --no-stdin -- bash -lc \
+    "set -a; . $GUEST_ENV; set +a; export ANTHROPIC_MODEL=${CAGE_MODEL:-claude-haiku-4-5}; $GUEST_DIR/works.sh"
+}
 
 cmd_down() {
   if sandbox_exists; then
@@ -174,5 +179,5 @@ cmd_status() {
 case "${1:-}" in
   gw-up | gw-down | up | check | push | attack | works | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,24p' "$0"; exit 2 ;;
+  *) sed -n '2,25p' "$0"; exit 2 ;;
 esac
