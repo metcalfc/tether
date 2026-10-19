@@ -13,6 +13,10 @@
 #   cage.sh up         mint caps, boot the locked sandbox, push env + scripts
 #   cage.sh exec CMD   run CMD in the guest (bash -lc, env loaded)
 #   cage.sh check      the milestone-1 reachability probes
+#   cage.sh push       re-push env + guest scripts to a running sandbox
+#   cage.sh attack     run guest/attack.sh as root, with a live control
+#                      listener on host port CAGE_PORT+1 and the host LAN IP
+#   cage.sh works      run guest/works.sh
 #   cage.sh down       stop and remove the sandbox, stop the gateway
 #   cage.sh status
 #
@@ -129,6 +133,30 @@ cmd_check() {
   return "$fails"
 }
 
+cmd_push() { push_files "$(state_dir)/cage.env"; }
+
+cmd_attack() {
+  local ctl=$((PORT + 1)) lan pid rc=0
+  lan=$(ipconfig getifaddr en0 2>/dev/null || true)
+  # A real listener on the next port, on loopback and the LAN, so "blocked"
+  # cannot mean "nothing was listening".
+  python3 -m http.server "$ctl" --bind 0.0.0.0 >"$RUN/cage-control.log" 2>&1 &
+  pid=$!
+  echo "$pid" >"$RUN/cage-control.pid"
+  sleep 0.5
+  if [[ $(curl -s -o /dev/null -m 3 -w '%{http_code}' "http://127.0.0.1:$ctl/") != 200 ]]; then
+    kill "$pid" 2>/dev/null || true; die "control listener on $ctl did not come up"
+  fi
+  log "control listener on 0.0.0.0:$ctl answers 200 from the host; host LAN ${lan:-unknown}"
+  limit 300 "$MSB" exec "$NAME" --no-stdin -- bash -lc \
+    "set -a; . $GUEST_ENV; set +a; export LEASH_GW=http://host.microsandbox.internal:$PORT CONTROL_PORT=$ctl HOST_LAN=$lan; $GUEST_DIR/attack.sh" || rc=$?
+  kill "$pid" 2>/dev/null || true
+  rm -f "$RUN/cage-control.pid"
+  return "$rc"
+}
+
+cmd_works() { limit 600 "$MSB" exec "$NAME" --no-stdin -- bash -lc "set -a; . $GUEST_ENV; set +a; $GUEST_DIR/works.sh"; }
+
 cmd_down() {
   if sandbox_exists; then
     limit 60 "$MSB" stop "$NAME" >/dev/null 2>&1 || true
@@ -144,7 +172,7 @@ cmd_status() {
 }
 
 case "${1:-}" in
-  gw-up | gw-down | up | check | down | status) "cmd_${1//-/_}" ;;
+  gw-up | gw-down | up | check | push | attack | works | down | status) "cmd_${1//-/_}" ;;
   exec) shift; cmd_exec "$@" ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,24p' "$0"; exit 2 ;;
 esac

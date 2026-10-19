@@ -6,16 +6,19 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 1, second item: port `spike/guest/attack.sh` and `works.sh` to the
-msb guest as new files under `spike/msb/guest/` (cage.sh pushes
-`spike/msb/guest/*.sh` to `/opt/leash/` on `up`). Run them as root with
-`./spike/msb/cage.sh gw-up && ./spike/msb/cage.sh up && ./spike/msb/cage.sh exec /opt/leash/attack.sh`.
-Differences from the QEMU guest to handle: the image is `node:22-bookworm`
-(no `dig`, `ip`, `ping`, `nft`, `sudo`; you are already root), the gateway is
-`http://host.microsandbox.internal:18001` (`$LEASH_GW`), the msb gateway IP is
-`172.16.0.5` (read it from `/etc/hosts` rather than hard-coding it), and there's
-no 10.0.2.x. For DNS probes, use bash `/dev/udp` or a python3 socket rather than
-installing dig. Finish with `./spike/msb/cage.sh down`.
+Milestone 1, third item: Claude Code end to end in the guest through leash,
+on the cheap model. Boot with `./spike/msb/cage.sh gw-up && ./spike/msb/cage.sh up`,
+then install Claude Code through the CONNECT allowlist (registry.npmjs.org is
+already allowed): `./spike/msb/cage.sh exec 'npm install -g @anthropic-ai/claude-code'`.
+Then run `./spike/msb/cage.sh exec 'ANTHROPIC_MODEL=claude-haiku-4-5 claude -p "Reply with exactly: TETHER_OK"'`,
+or `cage.sh works`, whose last step does the same (add
+`ANTHROPIC_MODEL=claude-haiku-4-5` to that call, or export it in `cmd_works`).
+Things to watch: does Claude Code need to reach anything else, such as
+statsig, sentry or `api.anthropic.com/api/hello`? `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+is already set in cage.env. Look at `overnight/run/cage-gw.log` and the
+audit in `overnight/run/leash-msb/audit.jsonl` for refused requests. Record
+the spend from `./leash -c spike/msb/policy.json report` (or whatever today's
+leash calls it) in the Spend log. Finish with `./spike/msb/cage.sh down`.
 
 ## 0. Setup
 
@@ -59,7 +62,7 @@ Run 1 (2026-10-18) notes:
 ## 1. Cage (design day 1)
 
 - [x] An msb sandbox with `--net-default deny --net-rule "allow@host:tcp:P"`, with today's leash on the host
-- [ ] Port `spike/guest/attack.sh` and `works.sh` to the msb guest; every BLOCK line holds
+- [x] Port `spike/guest/attack.sh` and `works.sh` to the msb guest; every BLOCK line holds
 - [ ] Claude Code end to end in the guest through leash (cheap model)
 - [ ] Measure boot to agent-ready, and time to first byte through leash versus direct
 
@@ -90,6 +93,53 @@ Run 2 (2026-10-18) notes:
 - Boot: `msb create` until the first `msb exec` returns took **0.37 s**, with
   the image cached. That's a create-to-exec time, not boot to agent-ready
   (item 4).
+- No model calls this run.
+
+Run 3 (2026-10-18) notes:
+
+- New: `spike/msb/guest/attack.sh` and `works.sh` (pushed to `/opt/leash/` by
+  `cage.sh up`/`push`), and `cage.sh push|attack|works`. `cage.sh attack`
+  starts a real `python3 -m http.server` on host `0.0.0.0:18002` as a
+  control (checks it answers 200 from the host first), passes the host LAN IP
+  (`ipconfig getifaddr en0`) in, and runs attack.sh as guest root.
+- The DNS, ICMP, TCP and UDP probes are python3 socket code. The image has no
+  dig/ping/ip/nft, so the "flush the firewall" step is a no-op. That's moot
+  anyway, since enforcement is in the host msb process.
+- **attack.sh in the cage: 24/24 PASS**, with 21 BLOCK lines and 3 ALLOW lines.
+  - Blocked:
+    - direct HTTPS to a name, to an IP literal, to api.anthropic.com and over
+      IPv6;
+    - DNS over UDP and TCP, both to 1.1.1.1 and to the guest resolver
+      (172.16.0.5; NXDOMAIN or no answer counts as blocked);
+    - raw ICMP to 1.1.1.1 and to the gateway;
+    - UDP to the gateway port;
+    - host :22, plus live host :18002 by name, by IP and by LAN IP;
+    - the gateway port on the LAN IP;
+    - 169.254.169.254;
+    - through leash: example.com, a tunnel to api.anthropic.com, and a request
+      with no capability;
+    - no real key pattern in env or on disk.
+  - Allowed: the gateway by name and by IP, and pypi via the proxy.
+- **Negative control:** the same attack.sh in a sandbox with msb's default
+  (open) network.
+  - The direct HTTPS, IP literal, DNS (all 4) and ICMP-to-1.1.1.1 lines
+    flipped to "allow" (11 FAILs). So those probes do detect egress when it
+    exists.
+  - Host ports stayed blocked even there: **msb's default policy denies the
+    `host` group unless a rule allows it**. A third control
+    (`--net-default deny --net-rule allow@host:tcp:18002`) showed the tcp
+    probe does reach host :18002 when allowed. So the cage's host-port blocks
+    are real.
+  - IPv6 is blocked even when open (no global v6 in the guest). ICMP and UDP
+    to the gateway get no reply even when open, so those two lines are weak
+    evidence on their own.
+- **works.sh in the cage: all ok.**
+  - A requests wheel from files.pythonhosted.org (73 KB).
+  - `npm view left-pad`.
+  - `git clone metcalfc/tether-scratch` with the token injected on the host.
+  - A clone of an unrouted repo (`metcalfc/imp`) is refused.
+  - The Claude Code step was skipped, because it isn't installed yet (next
+    item).
 - No model calls this run.
 
 ## 2. Kernel (design day 2, gate)
