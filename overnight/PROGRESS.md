@@ -6,16 +6,19 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 3, item 2: **channel binding** (one listener per sandbox on
-127.0.0.1; a cap works only on its own sandbox's listener). Suggested shape:
-policy gains `sandboxes: {name: {listen: "127.0.0.1:P"}}` (keep the
-top-level `listen` as a single-sandbox default), `build_server` starts one
-`ThreadingHTTPServer` per sandbox, each handler knows its sandbox name, and
-cap lookup refuses (403, audited with `sandbox`) a cap bound to another
-sandbox. Unit test: two listeners, cap A works on A's port and gets 403 on
-B's. Work in `./tether` and `tests/test_tether.py` only; `./leash` stays as
-is. The cap registry (item 3) will replace the static `sessions` list, so
-keep the sandbox->cap binding in one place that item 3 can take over.
+Milestone 3, item 3: **capability registry** (`tether cap mint|revoke|list`,
+minted per boot). Today `Gateway.sessions` (cap -> session, from
+`state_dir/sessions.json`) plus `Policy.session_sandbox` (session ->
+sandbox) are the binding; `Gateway.identify(presented, sandbox)` is the
+single lookup that returns `(session, refusal)`. Replace both with a registry
+record per cap: `{cap_id, sandbox, session, agent, tool, human, routes,
+egress, spend sub-cap, expiry, revoked}`, persisted 0600 in state_dir, and
+re-read (or watched) by `serve` so `tether cap revoke` takes effect on the
+next request without a restart. Keep `identify` as the entry point (have it
+return the record). `tether init` / the `sessions` list can mint the
+default caps so leash-style policies keep working. Unit tests: mint, list,
+revoke takes effect on a running server, an expired cap is refused, a cap
+minted for sandbox A is refused on B.
 Boot the cage with the Landlock kernel when a VM is needed:
 `export MSB_LIBKRUNFW_PATH=$PWD/overnight/run/krunfw-landlock/libkrunfw.5.dylib`
 (rebuild with `spike/msb/kernel/build.sh overnight/run/libkrunfw overnight/run/krunfw-landlock`
@@ -263,7 +266,7 @@ Run 6 (2026-10-18) notes:
 ## 3–4. tether core
 
 - [x] Copy `./leash` to `./tether` and `tests/test_leash.py` to `tests/test_tether.py`; rename inside; both suites pass
-- [ ] Channel binding: one listener per sandbox
+- [x] Channel binding: one listener per sandbox
 - [ ] Capability registry: `tether cap mint|revoke|list`, minted per boot
 - [ ] Per-cap policy intersected with the ceiling
 - [ ] CONNECT hardening: resolve on the host; refuse private addresses; connect to the checked IP; match SNI; refuse IP literals
@@ -289,6 +292,40 @@ Run 7 (2026-10-18) notes:
 - Makefile: `make tether-test`, `make leash-test`; `make lint` now covers
   `tether`. `make test` discovers both suites: **29 tests OK** (leash 14
   unchanged, tether 15). ruff clean.
+- No model calls this run, no VM booted.
+
+Run 8 (2026-10-18) notes:
+
+- **Policy:** new optional `sandboxes: {name: {listen, advertise?,
+  sessions?}}`. `advertise` defaults to
+  `http://host.microsandbox.internal:<listen port>`; `sessions` defaults to
+  `[name]`. Without `sandboxes`, the top-level `listen`/`advertise`/`sessions`
+  are one sandbox called `default` (leash's shape, so `spike/msb/policy.json`
+  still loads). A session listed in two sandboxes, or `sessions` at the top
+  level next to `sandboxes`, is a `ValueError`.
+- **Gateway:** `build_servers(policy) -> ({sandbox: Server}, Gateway)`
+  replaces `build_server`; every listener shares one Gateway (ledger, audit,
+  caps). `make_handler(gw, sandbox)` bakes the sandbox name into the handler.
+  `Gateway.identify(presented, sandbox) -> (session, refusal)` replaces
+  `session_for`: a real cap bound to another sandbox is refused with **403**
+  (CONNECT too: 403, not 407, since the cap is real but on the wrong
+  channel), and never reaches the upstream. The guest sees only "capability
+  is not valid on this sandbox's channel"; the audit line has the detail.
+- **Audit:** every line now carries `sandbox`; the stderr log shows
+  `[sandbox/session]`. Env files are per sandbox advertise URL.
+- **Tests:** `test_audit_names_the_sandbox` plus a `ChannelBindingTest` class
+  (two listeners; cap A 200 on A and 403 on B for routes and CONNECT, with
+  no upstream call; env advertises each listener; duplicate session refused).
+  `make test`: **35 tests OK** (leash 14 unchanged, tether 21). ruff clean.
+- **Real run:** `tether serve` with two sandboxes on 127.0.0.1:18101/18102
+  (policy in `overnight/run/cb/`), curl through each port to
+  registry.npmjs.org: own cap on own port 200 (both directions), the other
+  sandbox's cap CONNECT **403**, audited as e.g. `DENY [other/-] egress
+  registry.npmjs.org:443 -- capability of session chad-dev is bound to
+  sandbox chad-dev, used on other`. Not yet tried from inside an msb guest
+  (that is milestone 7 item 4).
+- Note: the Bash tool's shell is zsh, which doesn't word-split `$var`; run
+  ad-hoc loops under `/bin/bash -c`.
 - No model calls this run, no VM booted.
 
 ## 5. Identity in the guest

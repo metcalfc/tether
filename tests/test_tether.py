@@ -137,7 +137,8 @@ class TetherTest(unittest.TestCase):
         p = Path(self.tmp.name) / "policy.json"
         p.write_text(json.dumps(cfg))
         self.policy = tether.Policy(p)
-        self.srv, self.gw = tether.build_server(self.policy)
+        srvs, self.gw = tether.build_servers(self.policy)
+        self.srv = srvs["default"]
         threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.port = self.srv.server_address[1]
         self.caps = {name: cap for cap, name in self.gw.sessions.items()}
@@ -313,10 +314,116 @@ class TetherTest(unittest.TestCase):
         p.write_text("{}")
         self.assertEqual(tether.Policy(p).state_dir, (Path(self.tmp.name) / "run" / "tether").resolve())
 
+    def test_audit_names_the_sandbox(self) -> None:
+        self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
+        self.assertEqual(self.audit()[-1]["sandbox"], "default")
+
     def test_report_runs(self) -> None:
         self.post("/anthropic/v1/messages", {"stream": True}, {"Authorization": "Bearer " + self.caps["alice"]})
         self.connect("evil.example:443")[1].close()
         tether.cmd_report(self.policy, as_json=False)
+
+
+class ChannelBindingTest(unittest.TestCase):
+    """Two sandboxes, two listeners: a cap only works on its own sandbox's port."""
+
+    def setUp(self) -> None:
+        FakeUpstream.seen = []
+        self.up = serve(FakeUpstream)
+        self.echo = echo_server()
+        self.echo_port = self.echo.getsockname()[1]
+        self.tmp = tempfile.TemporaryDirectory()
+        up = f"http://127.0.0.1:{self.up.server_address[1]}"
+        cfg = {
+            "sandboxes": {
+                "chad-dev": {"listen": "127.0.0.1:0", "advertise": "http://host.microsandbox.internal:18001"},
+                "other": {"listen": "127.0.0.1:0", "sessions": ["o1", "o2"]},
+            },
+            "routes": {
+                "anthropic": {"upstream": up, "credential": "env:T_ANTHROPIC", "inject": "anthropic", "meter": True},
+            },
+            "egress": {"allow": ["localhost"], "ports": [self.echo_port]},
+        }
+        os.environ["T_ANTHROPIC"] = REAL_KEY
+        p = Path(self.tmp.name) / "policy.json"
+        p.write_text(json.dumps(cfg))
+        self.policy = tether.Policy(p)
+        self.srvs, self.gw = tether.build_servers(self.policy)
+        for s in self.srvs.values():
+            threading.Thread(target=s.serve_forever, daemon=True).start()
+        self.ports = {n: s.server_address[1] for n, s in self.srvs.items()}
+        self.caps = {name: cap for cap, name in self.gw.sessions.items()}
+
+    def tearDown(self) -> None:
+        for s in self.srvs.values():
+            s.shutdown()
+            s.server_close()
+        self.up.shutdown()
+        self.up.server_close()
+        self.echo.close()
+        self.tmp.cleanup()
+
+    def post(self, sandbox: str, cap: str) -> int:
+        c = http.client.HTTPConnection("127.0.0.1", self.ports[sandbox])
+        c.request("POST", "/anthropic/v1/messages", "{}", {"Authorization": "Bearer " + cap})
+        r = c.getresponse()
+        r.read()
+        c.close()
+        return r.status
+
+    def connect(self, sandbox: str, cap: str) -> bytes:
+        s = socket.create_connection(("127.0.0.1", self.ports[sandbox]))
+        auth = base64.b64encode(f"agent:{cap}".encode()).decode()
+        s.sendall(f"CONNECT localhost:{self.echo_port} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
+        head = s.recv(4096)
+        s.close()
+        return head.split(b"\r\n")[0]
+
+    def audit(self) -> list[dict[str, Any]]:
+        f = self.policy.state_dir / "audit.jsonl"
+        return [json.loads(x) for x in f.read_text().splitlines()]
+
+    def test_two_listeners_one_per_sandbox(self) -> None:
+        self.assertEqual(set(self.srvs), {"chad-dev", "other"})
+        self.assertNotEqual(self.ports["chad-dev"], self.ports["other"])
+        # a sandbox with no session list gets one session named after it
+        self.assertEqual(self.policy.session_sandbox, {"chad-dev": "chad-dev", "o1": "other", "o2": "other"})
+
+    def test_cap_works_only_on_its_own_listener(self) -> None:
+        self.assertEqual(self.post("chad-dev", self.caps["chad-dev"]), 200)
+        self.assertEqual(self.post("other", self.caps["o1"]), 200)
+        n = len(FakeUpstream.seen)
+        self.assertEqual(self.post("other", self.caps["chad-dev"]), 403)
+        self.assertEqual(self.post("chad-dev", self.caps["o2"]), 403)
+        self.assertEqual(len(FakeUpstream.seen), n, "a replayed cap must not reach the upstream")
+        denies = [r for r in self.audit() if r["decision"] == "deny"]
+        self.assertEqual([r["sandbox"] for r in denies], ["other", "chad-dev"])
+        self.assertIn("bound to sandbox chad-dev", denies[0]["reason"])
+
+    def test_connect_cap_works_only_on_its_own_listener(self) -> None:
+        self.assertIn(b"200", self.connect("chad-dev", self.caps["chad-dev"]))
+        # 403, not 407: the cap is real, it is on the wrong channel
+        self.assertIn(b"403", self.connect("other", self.caps["chad-dev"]))
+        rec = self.audit()[-1]
+        self.assertEqual((rec["decision"], rec["sandbox"]), ("deny", "other"))
+
+    def test_env_advertises_each_sandbox_listener(self) -> None:
+        files = {f.stem: f.read_text() for f in tether.write_env_files(self.policy, self.gw.sessions)}
+        self.assertIn("ANTHROPIC_BASE_URL=http://host.microsandbox.internal:18001/anthropic", files["chad-dev"])
+        # default advertise is the msb host alias on the sandbox's listen port
+        self.assertIn(
+            f"host.microsandbox.internal:{self.policy.sandboxes['other'].listen.rpartition(':')[2]}", files["o1"]
+        )
+
+    def test_session_in_two_sandboxes_is_refused(self) -> None:
+        p = Path(self.tmp.name) / "dup.json"
+        p.write_text(
+            json.dumps(
+                {"sandboxes": {"a": {"listen": "127.0.0.1:0"}, "b": {"listen": "127.0.0.1:0", "sessions": ["a"]}}}
+            )
+        )
+        with self.assertRaises(ValueError):
+            tether.Policy(p)
 
 
 if __name__ == "__main__":

@@ -149,6 +149,17 @@ class Route:
             raise ValueError(f"route {self.name}: unknown inject mode {self.inject!r}")
 
 
+class Sandbox:
+    """One machine, one listener. The port a request arrives on says which
+    sandbox sent it: the guest can't choose it, so it can't forge it."""
+
+    def __init__(self, name: str, listen: str, advertise: str, sessions: list[str]) -> None:
+        self.name = name
+        self.listen = listen
+        self.advertise = advertise
+        self.sessions = sessions
+
+
 class Policy:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -157,7 +168,27 @@ class Policy:
         self.listen: str = cfg.get("listen", "0.0.0.0:8080")
         self.advertise: str = cfg.get("advertise", "http://tether:8080")
         self.state_dir = (base / cfg.get("state_dir", "run/tether")).resolve()
-        self.session_names: list[str] = cfg.get("sessions", ["default"])
+        # Without a `sandboxes` map, the top-level listen/advertise/sessions
+        # are one sandbox called "default" -- leash's single-listener shape.
+        self.sandboxes: dict[str, Sandbox] = {}
+        if "sandboxes" in cfg:
+            if "sessions" in cfg:
+                raise ValueError("policy: list sessions under each sandbox, not at the top level")
+            for name, sc in cfg["sandboxes"].items():
+                listen = sc["listen"]
+                port = listen.rpartition(":")[2]
+                adv = sc.get("advertise", f"http://host.microsandbox.internal:{port}")
+                self.sandboxes[name] = Sandbox(name, listen, adv, sc.get("sessions", [name]))
+        else:
+            sessions = cfg.get("sessions", ["default"])
+            self.sandboxes["default"] = Sandbox("default", self.listen, self.advertise, sessions)
+        self.session_sandbox: dict[str, str] = {}
+        for sb in self.sandboxes.values():
+            for s in sb.sessions:
+                if s in self.session_sandbox:
+                    raise ValueError(f"policy: session {s} is in sandboxes {self.session_sandbox[s]} and {sb.name}")
+                self.session_sandbox[s] = sb.name
+        self.session_names: list[str] = list(self.session_sandbox)
         self.routes: dict[str, Route] = {}
         self.disabled_routes: list[str] = []
         for name, rc in cfg.get("routes", {}).items():
@@ -197,10 +228,12 @@ def load_sessions(policy: Policy) -> dict[str, str]:
     return {cap: name for name, cap in by_name.items() if name in policy.session_names}
 
 
-def env_for(policy: Policy, cap: str) -> dict[str, str]:
+def env_for(policy: Policy, cap: str, advertise: str | None = None) -> dict[str, str]:
     """What the agent's machine gets. Nothing in here is a credential: each
-    value is worthless anywhere but through this gateway."""
-    adv = urllib.parse.urlsplit(policy.advertise)
+    value is worthless anywhere but through this gateway, on its own
+    sandbox's listener."""
+    advertise = advertise or policy.advertise
+    adv = urllib.parse.urlsplit(advertise)
     host = adv.netloc
     authed = f"{adv.scheme}://agent:{cap}@{host}"
     env = {
@@ -216,10 +249,10 @@ def env_for(policy: Policy, cap: str) -> dict[str, str]:
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
     if "anthropic" in policy.routes:
-        env["ANTHROPIC_BASE_URL"] = f"{policy.advertise}/anthropic"
+        env["ANTHROPIC_BASE_URL"] = f"{advertise}/anthropic"
         env["ANTHROPIC_AUTH_TOKEN"] = cap
     if "openai" in policy.routes:
-        env["OPENAI_BASE_URL"] = f"{policy.advertise}/openai/v1"
+        env["OPENAI_BASE_URL"] = f"{advertise}/openai/v1"
         env["OPENAI_API_KEY"] = cap
     if "github" in policy.routes:
         # git sees https://github.com/... and quietly talks to the gateway.
@@ -228,7 +261,7 @@ def env_for(policy: Policy, cap: str) -> dict[str, str]:
         env["GIT_CONFIG_VALUE_0"] = "https://github.com/"
     if "github-api" in policy.routes:
         env["GH_HOST"] = "github.com"
-        env["GITHUB_API_URL"] = f"{policy.advertise}/github-api"
+        env["GITHUB_API_URL"] = f"{advertise}/github-api"
     return env
 
 
@@ -236,9 +269,10 @@ def write_env_files(policy: Policy, sessions: dict[str, str]) -> list[Path]:
     out = []
     for cap, name in sessions.items():
         p = policy.state_dir / f"{name}.env"
-        lines = [f"{k}={v}" for k, v in env_for(policy, cap).items()]
+        sb = policy.sandboxes[policy.session_sandbox[name]]
+        lines = [f"{k}={v}" for k, v in env_for(policy, cap, sb.advertise).items()]
         body = "\n".join(lines)
-        p.write_text(f"# tether session {name} -- capabilities only, no credentials\n{body}\n")
+        p.write_text(f"# tether session {name} (sandbox {sb.name}) -- capabilities only, no credentials\n{body}\n")
         p.chmod(0o600)
         out.append(p)
     return out
@@ -294,7 +328,8 @@ class Audit:
         what = rec.get("host") or f"{rec.get('method')} /{rec.get('route')}{rec.get('path', '')}"
         extra = f" ${rec['usd']:.4f}" if rec.get("usd") else ""
         why = f" -- {rec['reason']}" if rec.get("reason") else ""
-        log(f"{flag} [{rec.get('session', '-')}] {rec.get('kind')} {what}{extra}{why}")
+        who = f"{rec.get('sandbox', '-')}/{rec.get('session', '-')}"
+        log(f"{flag} [{who}] {rec.get('kind')} {what}{extra}{why}")
 
 
 # --------------------------------------------------------------------- meter
@@ -419,12 +454,19 @@ class Gateway:
         self.audit = Audit(policy.state_dir / "audit.jsonl")
         self.cred_hosts = {r.host: name for name, r in policy.routes.items()}
 
-    def session_for(self, presented: list[str]) -> str | None:
+    def identify(self, presented: list[str], sandbox: str) -> tuple[str | None, str | None]:
+        """(session, refusal) for the caps presented on `sandbox`'s listener.
+        A cap that is real but bound to another sandbox is a replay: it is
+        refused outright, not treated as missing. The one place that knows
+        which sandbox a cap belongs to."""
         for cand in presented:
             for cap, name in self.sessions.items():
                 if cand and secrets.compare_digest(cand.encode(), cap.encode()):
-                    return name
-        return None
+                    bound = self.p.session_sandbox.get(name)
+                    if bound != sandbox:
+                        return None, f"capability of session {name} is bound to sandbox {bound}, used on {sandbox}"
+                    return name, None
+        return None, None
 
     def egress_ok(self, host: str, port: int) -> tuple[bool, str]:
         if port not in self.p.egress_ports:
@@ -464,7 +506,7 @@ def presented_tokens(headers: dict[str, str]) -> list[str]:
     return out
 
 
-def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
+def make_handler(gw: Gateway, sandbox: str) -> type[http.server.BaseHTTPRequestHandler]:
     class Handler(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
         server_version = "tether"
@@ -490,7 +532,8 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
 
         # ---- egress: CONNECT host:port, allowlisted, audited
         def do_CONNECT(self) -> None:
-            session = gw.session_for(presented_tokens(self._hdrs())) or "-"
+            found, refusal = gw.identify(presented_tokens(self._hdrs()), sandbox)
+            session = found or "-"
             host, _, port_s = self.path.rpartition(":")
             host = host.strip("[]").lower()
             try:
@@ -498,9 +541,17 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
             except ValueError:
                 self._error(400, "invalid_request_error", "bad CONNECT target")
                 return
+            if refusal:
+                gw.audit.write(
+                    kind="egress", decision="deny", sandbox=sandbox, session="-", host=f"{host}:{port}", reason=refusal
+                )
+                self._error(403, "permission_error", "capability is not valid on this sandbox's channel")
+                return
             ok, why = gw.egress_ok(host, port)
             if not ok:
-                gw.audit.write(kind="egress", decision="deny", session=session, host=f"{host}:{port}", reason=why)
+                gw.audit.write(
+                    kind="egress", decision="deny", sandbox=sandbox, session=session, host=f"{host}:{port}", reason=why
+                )
                 self._error(403, "permission_error", f"{host}:{port} refused: {why}")
                 return
             # Egress costs a capability like everything else: otherwise any
@@ -509,6 +560,7 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
                 gw.audit.write(
                     kind="egress",
                     decision="deny",
+                    sandbox=sandbox,
                     session=session,
                     host=f"{host}:{port}",
                     reason="bad or missing session capability",
@@ -526,6 +578,7 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
                 gw.audit.write(
                     kind="egress",
                     decision="allow",
+                    sandbox=sandbox,
                     session=session,
                     host=f"{host}:{port}",
                     status=502,
@@ -545,6 +598,7 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
             gw.audit.write(
                 kind="egress",
                 decision="allow",
+                sandbox=sandbox,
                 session=session,
                 host=f"{host}:{port}",
                 bytes_up=up_bytes,
@@ -556,12 +610,13 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
         def _proxy(self) -> None:
             t0 = time.monotonic()
             hdrs = self._hdrs()
-            session = gw.session_for(presented_tokens(hdrs))
+            session, refusal = gw.identify(presented_tokens(hdrs), sandbox)
             if self.path.startswith(("http://", "https://")):
                 host = urllib.parse.urlsplit(self.path).hostname
                 gw.audit.write(
                     kind="egress",
                     decision="deny",
+                    sandbox=sandbox,
                     session=session or "-",
                     host=f"{host}:80",
                     reason="plain-http forwarding is not offered",
@@ -582,6 +637,7 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
                 "route": name,
                 "method": self.command,
                 "path": rest,
+                "sandbox": sandbox,
                 "session": session or "-",
             }
             if route is None:
@@ -591,6 +647,10 @@ def make_handler(gw: Gateway) -> type[http.server.BaseHTTPRequestHandler]:
             if not route.allowed(rest):
                 gw.audit.write(decision="deny", reason="path is not on the route's allowlist", **rec)
                 self._error(403, "permission_error", f"{rest} is not allowed on /{name}/")
+                return
+            if refusal:
+                gw.audit.write(decision="deny", reason=refusal, **rec)
+                self._error(403, "permission_error", "capability is not valid on this sandbox's channel")
                 return
             if session is None:
                 gw.audit.write(decision="deny", reason="bad or missing session capability", **rec)
@@ -709,11 +769,19 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
             super().handle_error(request, client_address)
 
 
-def build_server(policy: Policy) -> tuple[Server, Gateway]:
+def build_servers(policy: Policy) -> tuple[dict[str, Server], Gateway]:
+    """One listener per sandbox, all sharing one gateway (ledger, audit, caps)."""
     gw = Gateway(policy)
-    host, _, port = policy.listen.rpartition(":")
-    srv = Server((host or "0.0.0.0", int(port)), make_handler(gw))
-    return srv, gw
+    srvs: dict[str, Server] = {}
+    try:
+        for name, sb in policy.sandboxes.items():
+            host, _, port = sb.listen.rpartition(":")
+            srvs[name] = Server((host or "0.0.0.0", int(port)), make_handler(gw, name))
+    except OSError:
+        for s in srvs.values():
+            s.server_close()
+        raise
+    return srvs, gw
 
 
 # ----------------------------------------------------------------------- cli
@@ -728,9 +796,11 @@ def cmd_init(policy: Policy) -> None:
 
 
 def cmd_serve(policy: Policy) -> None:
-    srv, gw = build_server(policy)
+    srvs, gw = build_servers(policy)
     write_env_files(policy, gw.sessions)
-    log(f"listening on {policy.listen}, advertised as {policy.advertise}")
+    for name, sb in policy.sandboxes.items():
+        sessions = ", ".join(sb.sessions)
+        log(f"sandbox {name}: listening on {sb.listen}, advertised as {sb.advertise}, sessions {sessions}")
     log(f"routes: {', '.join('/' + n + '/' for n in policy.routes) or 'none'}")
     for name in policy.disabled_routes:
         log(f"route /{name}/ disabled: its credential did not resolve")
@@ -741,9 +811,11 @@ def cmd_serve(policy: Policy) -> None:
     if policy.cap_total is not None:
         caps.append(f"${policy.cap_total:.2f}/team/day")
     log(f"spend caps: {', '.join(caps) or 'none'}")
-    log(f"sessions: {', '.join(sorted(gw.sessions.values()))}")
+    *rest, main_srv = srvs.values()
+    for s in rest:
+        threading.Thread(target=s.serve_forever, daemon=True).start()
     try:
-        srv.serve_forever()
+        main_srv.serve_forever()
     except KeyboardInterrupt:
         log("stopped -- every capability is inert until the gateway is back")
 
