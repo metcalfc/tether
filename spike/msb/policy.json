@@ -1,0 +1,43 @@
+{
+  "_note": "Milestone 1: today's leash on the host's loopback, reached from a microsandbox VM whose network policy is deny-all plus allow@host:tcp:18001. The guest dials host.microsandbox.internal:18001; msb's netstack splices it to 127.0.0.1:18001. Keys come from the keychain via cmd:, so they never enter an environment variable. State lives in overnight/run (gitignored).",
+  "listen": "127.0.0.1:18001",
+  "advertise": "http://host.microsandbox.internal:18001",
+  "state_dir": "../../overnight/run/leash-msb",
+  "sessions": ["cage"],
+
+  "routes": {
+    "anthropic": {
+      "upstream": "https://api.anthropic.com",
+      "credential": "cmd:security find-generic-password -s tether-anthropic -w",
+      "inject": "anthropic",
+      "paths": ["/v1/messages", "/v1/messages/count_tokens", "/v1/models", "/v1/models/*"],
+      "meter": true
+    },
+    "github": {
+      "upstream": "https://github.com",
+      "credential": "cmd:security find-generic-password -s tether-gh-scratch -w",
+      "inject": "basic:x-access-token",
+      "paths": [
+        "/metcalfc/tether-scratch/info/refs", "/metcalfc/tether-scratch.git/info/refs",
+        "/metcalfc/tether-scratch/git-upload-pack", "/metcalfc/tether-scratch.git/git-upload-pack",
+        "/metcalfc/tether-scratch/git-receive-pack", "/metcalfc/tether-scratch.git/git-receive-pack"
+      ]
+    }
+  },
+
+  "egress": {
+    "allow": ["pypi.org", "files.pythonhosted.org", "registry.npmjs.org"],
+    "ports": [443]
+  },
+
+  "spend": {
+    "per_session_usd_per_day": 2.0
+  },
+
+  "prices_per_mtok": {
+    "claude-opus": [5, 25],
+    "claude-sonnet": [3, 15],
+    "claude-haiku": [1, 5],
+    "default": [5, 25]
+  }
+}

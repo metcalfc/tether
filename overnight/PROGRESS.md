@@ -6,13 +6,16 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 1, first item: boot an msb sandbox with
-`--net-default deny --net-rule "allow@host:tcp:P"` while today's `./leash`
-serves on the host (key via `cmd:` from the keychain, never exported), and
-check that the guest reaches `host.microsandbox.internal:P` and nothing else.
-Look at `spike/policy.json` and `spike/vm.sh` for how leash is wired for the
-QEMU spike, and write the msb equivalent under `spike/msb/` (new files only;
-don't modify the existing spike files).
+Milestone 1, second item: port `spike/guest/attack.sh` and `works.sh` to the
+msb guest as new files under `spike/msb/guest/` (cage.sh pushes
+`spike/msb/guest/*.sh` to `/opt/leash/` on `up`). Run them as root with
+`./spike/msb/cage.sh gw-up && ./spike/msb/cage.sh up && ./spike/msb/cage.sh exec /opt/leash/attack.sh`.
+Differences from the QEMU guest to handle: the image is `node:22-bookworm`
+(no `dig`, `ip`, `ping`, `nft`, `sudo`; you are already root), the gateway is
+`http://host.microsandbox.internal:18001` (`$LEASH_GW`), the msb gateway IP is
+`172.16.0.5` (read it from `/etc/hosts` rather than hard-coding it), and there's
+no 10.0.2.x. For DNS probes, use bash `/dev/udp` or a python3 socket rather than
+installing dig. Finish with `./spike/msb/cage.sh down`.
 
 ## 0. Setup
 
@@ -55,10 +58,39 @@ Run 1 (2026-10-18) notes:
 
 ## 1. Cage (design day 1)
 
-- [ ] An msb sandbox with `--net-default deny --net-rule "allow@host:tcp:P"`, with today's leash on the host
+- [x] An msb sandbox with `--net-default deny --net-rule "allow@host:tcp:P"`, with today's leash on the host
 - [ ] Port `spike/guest/attack.sh` and `works.sh` to the msb guest; every BLOCK line holds
 - [ ] Claude Code end to end in the guest through leash (cheap model)
 - [ ] Measure boot to agent-ready, and time to first byte through leash versus direct
+
+Run 2 (2026-10-18) notes:
+
+- New files: `spike/msb/policy.json` (leash policy: listen `127.0.0.1:18001`,
+  advertise `http://host.microsandbox.internal:18001`, both keys via
+  `cmd:security find-generic-password ...`, github paths limited to
+  `metcalfc/tether-scratch`, spend cap $2/session/day, state in
+  `overnight/run/leash-msb/`) and `spike/msb/cage.sh` (`gw-up`, `gw-down`,
+  `up`, `exec`, `check`, `down`, `status`). The gateway runs in the background
+  with a pidfile at `overnight/run/cage-gw.pid` and a log at `cage-gw.log`.
+- Image: **`node:22-bookworm`**, not debian-slim, because it ships git, curl,
+  python3 and CA certs, and Claude Code can be `npm install`ed through the
+  CONNECT allowlist (registry.npmjs.org). The image can't be provisioned with
+  an open network first: `msb modify` can't change network rules.
+- `cage.sh check` (run as guest root), all PASS:
+  gateway reachable (404 from leash on `/`); host port 22 and host port
+  18002 blocked, **with a real `python3 -m http.server` listening on
+  127.0.0.1:18002 as a control** (the host saw 200, the guest got 000);
+  direct `https://example.com`, `https://1.1.1.1` and `https://api.anthropic.com`
+  blocked; `getent hosts example.com` returns nothing (NXDOMAIN). Through
+  the proxy, `pypi.org` returned 200 and `example.com` was refused.
+- Guest view: `/etc/hosts` maps `host.microsandbox.internal` to `172.16.0.5`
+  (the /30 gateway); the guest has only a link-local IPv6 address and no IPv6
+  default route under `--net-default deny`, which partly answers the design's
+  IPv6 open question: there's no global v6 to try.
+- Boot: `msb create` until the first `msb exec` returns took **0.37 s**, with
+  the image cached. That's a create-to-exec time, not boot to agent-ready
+  (item 4).
+- No model calls this run.
 
 ## 2. Kernel (design day 2, gate)
 
