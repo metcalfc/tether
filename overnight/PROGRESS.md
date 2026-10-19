@@ -6,23 +6,24 @@ measurements, the decisions and why, and the exact next step.
 
 ## Next step
 
-Milestone 1, fourth item: measure boot to agent-ready, and time to first byte
-through leash versus direct. Plan:
-- Boot to agent-ready: `cage.sh gw-up`, then time from `msb create` until
-  `claude --version` answers in the guest. Claude Code isn't in the image, so
-  either time it with the npm install (about 16 s through the proxy) and also
-  without it, or build a pre-baked image. Report both numbers honestly.
-- TTFB: a tiny stdlib Python client on the **host** that sends the same small,
-  streaming `/v1/messages` request (claude-haiku-4-5, max_tokens 16) N=20
-  times. Direct to api.anthropic.com with the key read in that process from
-  the keychain (never printed or logged), and through leash at
-  `http://127.0.0.1:18001/anthropic` with the cage capability from
-  `overnight/run/leash-msb/caps.json` (or cage.env). Record p50/p95 TTFB for
-  each, plus CONNECT setup time (e.g. `curl -w %{time_appconnect}` via the
-  proxy to registry.npmjs.org versus direct). Optionally repeat the
-  through-leash run from inside the guest to include msb's netstack hop.
-  Keep it cheap: about 40 haiku calls in total is well under $0.05.
-Then tear down with `cage.sh down`.
+Milestone 2, first item: build libkrunfw with Landlock and load it with
+`MSB_LIBKRUNFW_PATH`. Plan:
+- Find the libkrunfw version msb 0.7.8 ships (`~/.microsandbox/lib/libkrunfw.5.dylib`,
+  kernel 6.12.111 per `uname -r` in the guest; check `strings` for a
+  version, or the microsandbox repo's pinned libkrunfw tag). Clone that tag
+  of `containers/libkrunfw` into `overnight/run/libkrunfw/` (gitignored).
+- Add `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and
+  `CONFIG_LSM="landlock,..."` to its kernel config (`config-libkrunfw_aarch64`).
+- macOS build: libkrunfw's README builds the kernel in a Linux container.
+  Docker 29.9.1 is available (`/usr/local/bin/docker`) and so is
+  `limactl`. Build the kernel in an arm64 Linux container, then produce the
+  dylib on the host (`make` on macOS links the generated `kernel.c`). Put
+  every long step under `perl -e 'alarm shift; exec @ARGV' N`, run it in the
+  background with a log under `overnight/run/`.
+- Test: `MSB_LIBKRUNFW_PATH=<dylib> msb run --mount-dir ~/.microsandbox/tether-guest/bin:/opt/nono:ro debian:bookworm-slim -- /opt/nono/nono setup --check-only`
+  should report a Landlock ABI (want V4+), and `cat /sys/kernel/security/lsm`
+  should list landlock.
+- Gate: about two runs of real effort, then take the nftables fallback.
 
 ## 0. Setup
 
@@ -68,7 +69,7 @@ Run 1 (2026-10-18) notes:
 - [x] An msb sandbox with `--net-default deny --net-rule "allow@host:tcp:P"`, with today's leash on the host
 - [x] Port `spike/guest/attack.sh` and `works.sh` to the msb guest; every BLOCK line holds
 - [x] Claude Code end to end in the guest through leash (cheap model)
-- [ ] Measure boot to agent-ready, and time to first byte through leash versus direct
+- [x] Measure boot to agent-ready, and time to first byte through leash versus direct
 
 Run 2 (2026-10-18) notes:
 
@@ -163,6 +164,49 @@ Run 4 (2026-10-18) notes:
   $0.0032, cache read).
 - Spend this run: 2 model calls, $0.0407 (leash report, session `cage`).
 
+Run 5 (2026-10-18) notes:
+
+- New: `spike/msb/bench.py` (stdlib). `ttfb` sends the same streaming
+  haiku `/v1/messages` (max_tokens 32) N times to each target, interleaved,
+  each on a fresh connection, and records time to headers, time to the first
+  SSE `data:` line, and the mean SSE inter-chunk gap. Direct reads the key
+  from the keychain inside the bench process only. `--gateway-only` runs it
+  in the guest. `connect` times curl's `time_appconnect` to
+  registry.npmjs.org via the proxy versus direct. Raw results in
+  `overnight/run/bench-*.json` (not committed).
+- **TTFB, host client, n=20 each:** direct p50 513.0 / p95 583.9 ms;
+  through leash p50 516.3 / p95 567.9 ms. **Added at p50: +3.3 ms** (p95
+  -16 ms, i.e. noise). Under the design's 5 ms target. SSE inter-chunk
+  gap p50 15.7 ms direct vs 15.9 ms through leash (p95 16.6 vs 19.6): leash
+  does not buffer the stream. Headers arrive together with the first event,
+  so headers time = TTFB here.
+- **TTFB from inside the guest** (through msb's netstack, then leash), n=20:
+  p50 516.8 / p95 561.5 ms, so the msb hop adds about 0.5 ms on top.
+- **CONNECT setup** (TLS ready to registry.npmjs.org): host direct p50 37.0 /
+  p95 48.5 ms; host through leash's CONNECT p50 32.7 / p95 38.6 ms (n=10;
+  leash being slightly faster is likely address-selection noise). **From the
+  guest through the proxy: p50 ~86 ms** (range 80-91, n=10): about +50 ms per
+  new tunnel, i.e. each round trip through msb's userspace netstack costs
+  on the order of 10-15 ms of the TCP + CONNECT + TLS handshakes. A plain
+  HTTP request to leash from the guest pays it once (the 0.5 ms above is
+  within noise of that being small for one already-ACKed request); tunnels
+  pay it per handshake RTT. Worth re-measuring in milestone 7.
+- **Boot to agent-ready** (node:22-bookworm cached, 4 vCPU, 4 GiB):
+  `cage.sh up` (leash init + `msb create` + first exec + pushing env and
+  scripts) **0.63 s**, of which create-to-first-exec 0.38 s. Claude Code is
+  not in the image: `npm install -g @anthropic-ai/claude-code` plus `claude
+  --version` through the CONNECT allowlist took **10.8 s** (16 s in run 4).
+  So **~11.4 s to agent-ready with install, ~0.7 s with a pre-baked image**
+  (the 0.7 s is create+push plus `claude --version` at 0.08 s; I did not build
+  a pre-baked image).
+- **Memory:** `msb machine` RSS 1.1 GB after the npm install (guest page cache
+  is counted; the guest itself reports 84 MB used, 504 MB buff/cache of 3.9
+  GB); leash 36 MB RSS.
+- Spend this run: 44 calls via leash, $0.0057 (leash report, session `cage`
+  now $0.0464 total); plus 22 direct calls, not metered by leash, estimated
+  at under $0.005 from the same token counts.
+- No gate triggered (+3.3 ms << 50 ms, no stalled streams).
+
 ## 2. Kernel (design day 2, gate)
 
 - [ ] Build libkrunfw with `CONFIG_SECURITY=y`, `CONFIG_SECURITY_LANDLOCK=y` and landlock in `CONFIG_LSM`; load with `MSB_LIBKRUNFW_PATH`
@@ -215,5 +259,6 @@ Run 4 (2026-10-18) notes:
 | Run | Model calls | USD (from tether report) |
 | --- | --- | --- |
 | 4 | 2 (haiku, via leash) | $0.0407 |
+| 5 | 44 via leash + 22 direct (haiku, bench) | $0.0057 via leash; direct est. < $0.005 |
 
 ## Decisions and corrections
